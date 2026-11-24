@@ -35,6 +35,7 @@ function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [tutorialMode, setTutorialMode] = useState(false);
   const [endlessStage, setEndlessStage] = useState<Difficulty>('EASY');
+  const [generationError, setGenerationError] = useState<string | null>(null);
 
   // Timer effect
   useEffect(() => {
@@ -88,6 +89,7 @@ function App() {
       actions.setLanguage(language);
       actions.startLoading();
 
+      setGenerationError(null);
       setIsGenerating(true);
       const result = state.endlessMode
         ? await generateEndlessBatch('EASY', factors, language)
@@ -106,9 +108,9 @@ function App() {
         }
         audio.play("click");
       } else {
+        // Stay on difficulty select so the player keeps their settings and can retry.
         console.error("Failed to generate snippets:", result.error);
-        // Show error state or retry
-        actions.resetGame();
+        setGenerationError(result.error.message);
       }
       setIsGenerating(false);
     },
@@ -171,7 +173,7 @@ function App() {
                 actions.startPlaying();
               } else {
                 console.error("Failed to generate snippets:", result.error);
-                actions.resetGame();
+                setGenerationError(result.error.message);
               }
               setIsGenerating(false);
             }
@@ -250,12 +252,14 @@ function App() {
   // Handle restart
   const handleRestart = useCallback(() => {
     audio.stopAll();
+    setGenerationError(null);
     actions.resetGame();
   }, [actions, audio]);
 
   // Handle play button on home
   const handlePlay = useCallback(() => {
     audio.play("click");
+    setGenerationError(null);
     actions.resetGame();
     actions.startLoading();
   }, [actions, audio]);
@@ -293,6 +297,14 @@ function App() {
           }
           return (
             <>
+              {generationError && (
+                <div className="app-error" role="alert">
+                  <span>MISSION GENERATION FAILED: {generationError}</span>
+                  <button onClick={() => setGenerationError(null)} aria-label="Dismiss">
+                    ×
+                  </button>
+                </div>
+              )}
               <DifficultySelect
                 initialDifficulty={state.difficulty}
                 initialFactors={state.difficultyFactors}
