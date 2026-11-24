@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import "./AuditSplitScreen.css";
 
+// Mounted only while an audit runs; unmounting discards the animation state.
 interface AuditSplitScreenProps {
-  active: boolean;
   findingsCount: number;
 }
 
@@ -20,18 +20,12 @@ const LOG_LINES = [
   "Requesting Claude summary...",
 ];
 
-export function AuditSplitScreen({ active, findingsCount }: AuditSplitScreenProps) {
+export function AuditSplitScreen({ findingsCount }: AuditSplitScreenProps) {
   const [lines, setLines] = useState<string[]>([]);
   const [progress, setProgress] = useState(0);
-  const seed = useMemo(() => Math.floor(Math.random() * 1000), []);
-
   useEffect(() => {
-    if (!active) {
-      setLines([]);
-      setProgress(0);
-      return;
-    }
-
+    // Random is impure, so it belongs in the effect rather than in render.
+    const seed = Math.floor(Math.random() * 1000);
     let index = 0;
     const logTimer = setInterval(() => {
       const nextLine = LOG_LINES[index % LOG_LINES.length];
@@ -47,9 +41,7 @@ export function AuditSplitScreen({ active, findingsCount }: AuditSplitScreenProp
       clearInterval(logTimer);
       clearInterval(progressTimer);
     };
-  }, [active, seed]);
-
-  if (!active) return null;
+  }, []);
 
   return (
     <div className="audit-split">

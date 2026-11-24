@@ -1,11 +1,10 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import type { Language } from "../../types";
 import "./TutorialPanel.css";
 
 interface TutorialPanelProps {
   language: Language;
   hints?: string[];
-  taskId?: string;
 }
 
 const LANGUAGE_HINTS: Record<Language, string[]> = {
@@ -36,14 +35,13 @@ const LANGUAGE_HINTS: Record<Language, string[]> = {
   ],
 };
 
-export function TutorialPanel({ language, hints = [], taskId }: TutorialPanelProps) {
+// The parent renders this with a `key` per task, so React remounts it, and the
+// revealed count resets, whenever the task or language changes.
+export function TutorialPanel({ language, hints = [] }: TutorialPanelProps) {
   const [revealed, setRevealed] = useState(0);
   const fallbackHints = LANGUAGE_HINTS[language] || LANGUAGE_HINTS.javascript;
   const activeHints = hints.length ? hints : fallbackHints;
 
-  useEffect(() => {
-    setRevealed(0);
-  }, [taskId, language]);
   return (
     <div className="tutorial-panel">
       <div className="tutorial-title">TUTORIAL MODE</div>

@@ -29,12 +29,17 @@ function selectTasksToAudit(tasks: Task[], endlessMode: boolean): Task[] {
 function App() {
   const { state, currentTask, failedTasks, actions } = useGameState();
   const audio = useAudio();
-  const [showEmergency, setShowEmergency] = useState(false);
   const [showGameInfo, setShowGameInfo] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [tutorialMode, setTutorialMode] = useState(false);
   const [endlessStage, setEndlessStage] = useState<Difficulty>('EASY');
   const [generationError, setGenerationError] = useState<string | null>(null);
+
+  // Every way a round ends (timeout, wrong answer, last task) leaves the
+  // reducer in AUDITING with a reason, so the overlay is derived from that
+  // rather than tracked separately, where it could drift out of sync.
+  const showEmergency =
+    state.phase === "AUDITING" && !!state.gameOverReason && !state.auditStarted;
 
   // Timer effect
   useEffect(() => {
@@ -54,7 +59,6 @@ function App() {
     if (state.timeRemaining <= 0) {
       audio.play("warning");
       actions.timeUp();
-      setShowEmergency(true);
     } else if (state.timeRemaining <= 5) {
       // Play tick sound when time is low
       audio.play("tick");
@@ -129,7 +133,6 @@ function App() {
         audio.play("siren");
         actions.answerTask(answer);
         actions.gameOver("wrong_answer");
-        setShowEmergency(true);
         return;
       }
 
@@ -140,13 +143,6 @@ function App() {
         audio.play("success");
       } else {
         audio.play("warning");
-      }
-
-      // Flagging clean code ends the round: the reducer has already moved to
-      // AUDITING, so show the overlay that starts the audit.
-      if (answer === "vulnerable" && !currentTask.isVulnerable) {
-        setShowEmergency(true);
-        return;
       }
 
       const isLastTask = state.currentTaskIndex >= state.tasks.length - 1;
@@ -180,18 +176,12 @@ function App() {
           return;
         }
       }
-
-      // Check if game is complete
-      if (isLastTask) {
-        setShowEmergency(true);
-      }
     },
     [
       currentTask,
       actions,
       audio,
       state.currentTaskIndex,
-      state.tasks.length,
       state.endlessMode,
       state.tasks,
       state.difficultyFactors,
@@ -203,9 +193,7 @@ function App() {
 
   // Handle continue from emergency overlay
   const handleContinueFromEmergency = useCallback(async () => {
-    setShowEmergency(false);
-
-    // Start auditing
+    // Marks the audit as started, which also dismisses the overlay.
     actions.startAuditing();
 
     const tasksToAudit = selectTasksToAudit(state.tasks, state.endlessMode);
@@ -327,27 +315,16 @@ function App() {
 
       case "PLAYING":
         return (
-          <>
-            <GameScreen
-              tasks={state.tasks}
-              currentTaskIndex={state.currentTaskIndex}
-              currentTask={currentTask}
-              language={state.language}
-              timeRemaining={state.timeRemaining}
-              timePerTask={state.timePerTask}
-              onAnswer={handleAnswer}
-              showTutorial={tutorialMode}
-            />
-            {showEmergency && state.gameOverReason && (
-              <EmergencyOverlay
-                reason={state.gameOverReason}
-                onContinue={handleContinueFromEmergency}
-                score={state.score}
-                totalTasks={state.tasks.length}
-                correctAnswers={state.totalCorrect}
-              />
-            )}
-          </>
+          <GameScreen
+            tasks={state.tasks}
+            currentTaskIndex={state.currentTaskIndex}
+            currentTask={currentTask}
+            language={state.language}
+            timeRemaining={state.timeRemaining}
+            timePerTask={state.timePerTask}
+            onAnswer={handleAnswer}
+            showTutorial={tutorialMode}
+          />
         );
 
       case "AUDITING":
@@ -368,7 +345,6 @@ function App() {
                 overlay is up and the scan has not begun. */}
             {!state.auditReport && !showEmergency && (
               <AuditSplitScreen
-                active
                 findingsCount={
                   selectTasksToAudit(state.tasks, state.endlessMode).filter(
                     (t) => t.isVulnerable

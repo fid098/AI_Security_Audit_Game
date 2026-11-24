@@ -47,6 +47,7 @@ const initialState: GameState = {
   totalCorrect: 0,
   totalIncorrect: 0,
   gameOverReason: undefined,
+  auditStarted: false,
   auditReport: undefined,
 };
 
@@ -91,6 +92,7 @@ function gameReducer(state: GameState, action: GameAction): GameState {
         totalCorrect: 0,
         totalIncorrect: 0,
         gameOverReason: undefined,
+        auditStarted: false,
         auditReport: undefined,
       };
 
@@ -256,6 +258,7 @@ function gameReducer(state: GameState, action: GameAction): GameState {
       return {
         ...state,
         phase: 'AUDITING',
+        auditStarted: true,
       };
 
     case 'SET_AUDIT_REPORT':

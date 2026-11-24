@@ -84,9 +84,9 @@ export function GameScreen({
           />
           {showTutorial && (
             <TutorialPanel
+              key={`${currentTask.id}-${language}`}
               language={language}
-              hints={currentTask?.hints}
-              taskId={currentTask?.id}
+              hints={currentTask.hints}
             />
           )}
           <SecurityAction

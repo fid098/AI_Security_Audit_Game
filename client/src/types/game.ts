@@ -71,6 +71,8 @@ export interface GameState {
   totalCorrect: number;
   totalIncorrect: number;
   gameOverReason?: 'timeout' | 'wrong_answer' | 'completed';
+  // False between game over and the player dismissing the emergency overlay.
+  auditStarted: boolean;
   auditReport?: AuditReport;
 }
 
