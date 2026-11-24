@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
-import httpx
+import anthropic
+import httpx2
 import pytest
 
 from app.integrations import claude_client
@@ -25,42 +27,29 @@ def task_item(is_vulnerable: bool = True, vuln_type: str = "XSS") -> ClaudeTaskI
     return ClaudeTaskItem(code="x", isVulnerable=is_vulnerable, vulnerabilityType=vuln_type)
 
 
-class FakeResponse:
-    def __init__(self, payload, status_code: int = 200):
-        self._payload = payload
-        self.status_code = status_code
-        self.text = json.dumps(payload) if isinstance(payload, (dict, list)) else str(payload)
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError("error", request=None, response=self)
-
-    def json(self):
-        return self._payload
+def make_message(*blocks, stop_reason="end_turn"):
+    """A stand-in for the SDK's Message: content blocks plus a stop reason."""
+    return SimpleNamespace(content=list(blocks), stop_reason=stop_reason)
 
 
-def fake_client(response=None, raises=None):
-    """Build a stand-in for httpx.Client usable as a context manager."""
+def text_block(text):
+    return SimpleNamespace(type="text", text=text)
 
-    class _Client:
-        def __init__(self, *args, **kwargs):
-            self.captured = {}
 
-        def __enter__(self):
-            return self
+def fake_sdk_client(message=None, raises=None):
+    """A stand-in for anthropic.Anthropic that records the create() call."""
+    calls = []
 
-        def __exit__(self, *args):
-            return False
+    def create(**kwargs):
+        calls.append(kwargs)
+        if raises is not None:
+            raise raises
+        return message
 
-        def post(self, url, json=None, headers=None):
-            _Client.last_url = url
-            _Client.last_json = json
-            _Client.last_headers = headers
-            if raises is not None:
-                raise raises
-            return response
+    return SimpleNamespace(messages=SimpleNamespace(create=create), calls=calls)
 
-    return _Client
+
+REQUEST = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
 
 
 class TestExtractJson:
@@ -253,93 +242,104 @@ class TestCallClaude:
         return _call_claude(
             api_key="k",
             model="m",
-            version="v",
             system_prompt="s",
             user_prompt="u",
             max_tokens=10,
         )
 
+    def _use(self, monkeypatch, client):
+        monkeypatch.setattr(claude_client, "_client", lambda api_key: client)
+        return client
+
     def test_concatenates_text_content_blocks(self, monkeypatch):
-        response = FakeResponse({"content": [{"text": "part one"}, {"text": "part two"}]})
-        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
+        message = make_message(text_block("part one"), text_block("part two"))
+        self._use(monkeypatch, fake_sdk_client(message))
 
         assert self._call() == "part one\npart two"
 
-    def test_ignores_non_dict_content_blocks(self, monkeypatch):
-        response = FakeResponse({"content": [{"text": "kept"}, "dropped"]})
-        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
+    def test_thinking_blocks_contribute_no_text(self, monkeypatch):
+        thinking = SimpleNamespace(type="thinking", thinking="")
+        self._use(monkeypatch, fake_sdk_client(make_message(thinking, text_block("answer"))))
 
-        assert self._call() == "kept"
+        assert self._call() == "answer"
+
+    def test_sends_model_system_prompt_and_token_cap(self, monkeypatch):
+        client = self._use(monkeypatch, fake_sdk_client(make_message(text_block("ok"))))
+
+        self._call()
+
+        assert client.calls == [
+            {
+                "model": "m",
+                "max_tokens": 10,
+                "system": "s",
+                "messages": [{"role": "user", "content": "u"}],
+            }
+        ]
 
     def test_truncated_response_raises_instead_of_returning_partial_text(self, monkeypatch):
-        response = FakeResponse(
-            {"content": [{"text": '{"tasks": [{"code": "a'}], "stop_reason": "max_tokens"}
-        )
-        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
+        message = make_message(text_block('{"tasks": [{"code": "a'), stop_reason="max_tokens")
+        self._use(monkeypatch, fake_sdk_client(message))
 
         with pytest.raises(RuntimeError, match="truncated"):
             self._call()
 
     def test_refusal_raises(self, monkeypatch):
-        response = FakeResponse({"content": [], "stop_reason": "refusal"})
-        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
+        self._use(monkeypatch, fake_sdk_client(make_message(stop_reason="refusal")))
 
         with pytest.raises(RuntimeError, match="declined"):
             self._call()
 
-    def test_normal_completion_returns_text(self, monkeypatch):
-        response = FakeResponse({"content": [{"text": "done"}], "stop_reason": "end_turn"})
-        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
-
-        assert self._call() == "done"
-
-    def test_thinking_blocks_contribute_no_text(self, monkeypatch):
-        response = FakeResponse(
-            {
-                "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": "answer"}],
-                "stop_reason": "end_turn",
-            }
-        )
-        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
-
-        assert self._call() == "answer"
-
-    def test_unexpected_shape_is_returned_as_json(self, monkeypatch):
-        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(FakeResponse({"odd": 1})))
-
-        assert json.loads(self._call()) == {"odd": 1}
-
-    def test_sends_the_authentication_headers(self, monkeypatch):
-        client_cls = fake_client(FakeResponse({"content": [{"text": "ok"}]}))
-        monkeypatch.setattr(claude_client.httpx, "Client", client_cls)
-
-        self._call()
-
-        assert client_cls.last_headers["x-api-key"] == "k"
-        assert client_cls.last_headers["anthropic-version"] == "v"
-        assert client_cls.last_url == "https://api.anthropic.com/v1/messages"
-
     def test_timeout_becomes_a_runtime_error(self, monkeypatch):
-        monkeypatch.setattr(
-            claude_client.httpx, "Client", fake_client(raises=httpx.TimeoutException("slow"))
-        )
+        self._use(monkeypatch, fake_sdk_client(raises=anthropic.APITimeoutError(request=REQUEST)))
 
         with pytest.raises(RuntimeError, match="timed out"):
             self._call()
 
-    def test_http_error_becomes_a_runtime_error(self, monkeypatch):
-        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(FakeResponse({}, 429)))
+    @pytest.mark.parametrize(
+        ("error_cls", "status"),
+        [
+            (anthropic.BadRequestError, 400),
+            (anthropic.RateLimitError, 429),
+            (anthropic.InternalServerError, 500),
+            (anthropic.InternalServerError, 529),
+        ],
+    )
+    def test_status_errors_become_runtime_errors_with_the_code(
+        self, monkeypatch, error_cls, status
+    ):
+        error = error_cls("error", response=httpx2.Response(status, request=REQUEST), body=None)
+        self._use(monkeypatch, fake_sdk_client(raises=error))
 
-        with pytest.raises(RuntimeError, match="429"):
+        with pytest.raises(RuntimeError, match=str(status)):
             self._call()
 
     def test_connection_error_becomes_a_runtime_error(self, monkeypatch):
-        monkeypatch.setattr(
-            claude_client.httpx, "Client", fake_client(raises=httpx.ConnectError("no route"))
-        )
+        self._use(monkeypatch, fake_sdk_client(raises=anthropic.APIConnectionError(request=REQUEST)))
 
         with pytest.raises(RuntimeError, match="connection failed"):
             self._call()
+
+
+class TestClientFactory:
+    def test_configures_key_timeout_and_retries(self):
+        claude_client._client.cache_clear()
+        try:
+            client = claude_client._client("test-key")
+
+            assert client.api_key == "test-key"
+            assert client.max_retries == claude_client.MAX_RETRIES
+            assert client.timeout == claude_client.REQUEST_TIMEOUT_SECONDS
+        finally:
+            claude_client._client.cache_clear()
+
+    def test_reuses_one_client_per_key(self):
+        claude_client._client.cache_clear()
+        try:
+            assert claude_client._client("a") is claude_client._client("a")
+            assert claude_client._client("a") is not claude_client._client("b")
+        finally:
+            claude_client._client.cache_clear()
 
 
 class TestGenerateFrontendTasks:

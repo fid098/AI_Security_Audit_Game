@@ -104,7 +104,6 @@ Create a `.env` in the repo root. All values are optional.
 ```ini
 ANTHROPIC_API_KEY=your_key
 ANTHROPIC_MODEL=claude-sonnet-5
-ANTHROPIC_VERSION=2023-06-01
 
 ELEVENLABS_API_KEY=your_key
 ELEVENLABS_VOICE_ID=your_voice_id

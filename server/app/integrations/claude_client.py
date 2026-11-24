@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+from functools import lru_cache
 from itertools import cycle
 from uuid import uuid4
 
-import httpx
+import anthropic
 from pydantic import BaseModel, ValidationError
 
 from ..schemas import (
@@ -28,6 +29,10 @@ MAX_TOKENS = 16000
 
 # Thinking makes calls slower than the old 30s budget allowed.
 REQUEST_TIMEOUT_SECONDS = 120
+
+# Retries on top of the first attempt for transient failures (429, 5xx,
+# connection errors). Worst-case wall time is the timeout times (retries + 1).
+MAX_RETRIES = 3
 
 # Log lines that describe the scanner's own state rather than the code. They
 # are produced by hacktron.scan_with_hacktron, main.audit_tasks and
@@ -113,7 +118,6 @@ def generate_security_mentor_summary(
         raise RuntimeError("ANTHROPIC_API_KEY is not configured.")
 
     model = os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
-    version = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
 
     system_prompt = (
         "You are the Security Mentor. Provide a 3-sentence post-mortem summary focused "
@@ -137,7 +141,6 @@ def generate_security_mentor_summary(
     response = _call_claude(
         api_key=api_key,
         model=model,
-        version=version,
         system_prompt=system_prompt,
         user_prompt=json.dumps(user_prompt),
         max_tokens=MAX_TOKENS,
@@ -158,7 +161,6 @@ def _request_tasks_from_claude(
         raise RuntimeError("ANTHROPIC_API_KEY is not configured.")
 
     model = os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
-    version = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
 
     vulnerable_target = max(1, round(count * vuln_density))
     system_prompt = (
@@ -182,7 +184,6 @@ def _request_tasks_from_claude(
     response = _call_claude(
         api_key=api_key,
         model=model,
-        version=version,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         max_tokens=MAX_TOKENS,
@@ -191,54 +192,50 @@ def _request_tasks_from_claude(
     return _parse_json_payload(response)
 
 
+@lru_cache(maxsize=4)
+def _client(api_key: str) -> anthropic.Anthropic:
+    # One client per key, reused across requests so its connection pool is too.
+    # The SDK retries connection errors, 408, 409, 429 and 5xx with exponential
+    # backoff, honouring the server's retry-after header.
+    return anthropic.Anthropic(
+        api_key=api_key,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        max_retries=MAX_RETRIES,
+    )
+
+
 def _call_claude(
     api_key: str,
     model: str,
-    version: str,
     system_prompt: str,
     user_prompt: str,
     max_tokens: int,
 ) -> str:
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": version,
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-
     try:
-        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-    except httpx.TimeoutException as exc:
+        message = _client(api_key).messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+    # These are raised only once the SDK's retries are exhausted. The timeout
+    # check comes first because APITimeoutError subclasses APIConnectionError.
+    except anthropic.APITimeoutError as exc:
         raise RuntimeError("Claude API request timed out") from exc
-    except httpx.HTTPStatusError as exc:
-        raise RuntimeError(f"Claude API error: {exc.response.status_code}") from exc
-    except httpx.RequestError as exc:
-        raise RuntimeError(f"Claude API connection failed: {str(exc)}") from exc
+    except anthropic.APIConnectionError as exc:
+        raise RuntimeError(f"Claude API connection failed: {exc}") from exc
+    except anthropic.APIStatusError as exc:
+        raise RuntimeError(f"Claude API error: {exc.status_code}") from exc
 
     # A truncated or refused reply would otherwise reach the JSON parser and
     # surface as a confusing parse error.
-    stop_reason = data.get("stop_reason") if isinstance(data, dict) else None
-    if stop_reason == "max_tokens":
+    if message.stop_reason == "max_tokens":
         raise RuntimeError("Claude response was truncated (max_tokens reached)")
-    if stop_reason == "refusal":
+    if message.stop_reason == "refusal":
         raise RuntimeError("Claude declined the request")
 
-    if isinstance(data, dict) and "content" in data:
-        parts = data.get("content") or []
-        text_chunks = [part.get("text", "") for part in parts if isinstance(part, dict)]
-        return "\n".join(text_chunks).strip()
-
-    return json.dumps(data)
+    # Thinking blocks carry no answer text; only text blocks do.
+    return "\n".join(block.text for block in message.content if block.type == "text").strip()
 
 # Helper to parse and validate Claude JSON response
 def _parse_json_payload(text: str) -> ClaudeTaskPayload:
