@@ -156,8 +156,10 @@ def generate_snippets(payload: GenerateSnippetsRequest) -> GenerateSnippetsRespo
             detail=str(exc)
         ) from exc
     except ValueError as exc:
+        # The request was valid; Claude's reply was not. That is an upstream
+        # fault, so 502 rather than a 400 that blames the caller.
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(exc)
         ) from exc
     except Exception as exc:

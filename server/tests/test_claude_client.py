@@ -83,6 +83,18 @@ class TestExtractJson:
         text = '{"code": "function f() { return 1; }"}'
         assert json.loads(_extract_json(text))["code"] == "function f() { return 1; }"
 
+    @pytest.mark.parametrize(
+        "code", ["if (a) { run(", "}", "arr[0", "]]]", 'say("{")']
+    )
+    def test_unbalanced_brackets_inside_strings_do_not_confuse_it(self, code):
+        """Bracket counting broke on these; a real parser skips string contents."""
+        text = "Here you go: " + json.dumps({"tasks": [{"code": code}]}) + " done"
+
+        assert json.loads(_extract_json(text))["tasks"][0]["code"] == code
+
+    def test_skips_bracketed_prose_that_is_not_json(self):
+        assert _extract_json('As noted [here], the result is {"a": 1}') == '{"a": 1}'
+
     def test_returns_only_the_first_complete_object(self):
         assert _extract_json('{"a": 1} {"b": 2}') == '{"a": 1}'
 
@@ -223,6 +235,18 @@ class TestStripHeadingMarks:
     def test_empty_input_is_handled(self):
         assert _strip_heading_marks("") == ""
 
+    def test_prose_punctuation_survives(self):
+        """An earlier character allowlist turned "user's" into "users"."""
+        text = "The handler's query (line 3) concatenates input: use \"?\" placeholders; don't format."
+        assert _strip_heading_marks(text) == text
+
+    def test_snake_case_identifiers_are_kept(self):
+        assert _strip_heading_marks("Validate user_id first.") == "Validate user_id first."
+
+    def test_bullets_quotes_and_code_ticks_are_removed(self):
+        text = "- First point\n* Second `innerHTML` point\n> quoted"
+        assert _strip_heading_marks(text) == "First point Second innerHTML point quoted"
+
 
 class TestCallClaude:
     def _call(self):
@@ -246,6 +270,39 @@ class TestCallClaude:
         monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
 
         assert self._call() == "kept"
+
+    def test_truncated_response_raises_instead_of_returning_partial_text(self, monkeypatch):
+        response = FakeResponse(
+            {"content": [{"text": '{"tasks": [{"code": "a'}], "stop_reason": "max_tokens"}
+        )
+        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
+
+        with pytest.raises(RuntimeError, match="truncated"):
+            self._call()
+
+    def test_refusal_raises(self, monkeypatch):
+        response = FakeResponse({"content": [], "stop_reason": "refusal"})
+        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
+
+        with pytest.raises(RuntimeError, match="declined"):
+            self._call()
+
+    def test_normal_completion_returns_text(self, monkeypatch):
+        response = FakeResponse({"content": [{"text": "done"}], "stop_reason": "end_turn"})
+        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
+
+        assert self._call() == "done"
+
+    def test_thinking_blocks_contribute_no_text(self, monkeypatch):
+        response = FakeResponse(
+            {
+                "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": "answer"}],
+                "stop_reason": "end_turn",
+            }
+        )
+        monkeypatch.setattr(claude_client.httpx, "Client", fake_client(response))
+
+        assert self._call() == "answer"
 
     def test_unexpected_shape_is_returned_as_json(self, monkeypatch):
         monkeypatch.setattr(claude_client.httpx, "Client", fake_client(FakeResponse({"odd": 1})))
@@ -384,6 +441,46 @@ class TestGenerateSecurityMentorSummary:
 
         sent = json.loads(captured["user_prompt"])
         assert sent["hacktron_logs"] == ["unescaped output sink"]
+
+    def test_every_scanner_status_message_is_withheld(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        captured = {}
+        monkeypatch.setattr(
+            claude_client, "_call_claude", lambda **kwargs: captured.update(kwargs) or "ok"
+        )
+        status_lines = [
+            claude_client.NOT_CONFIGURED_MESSAGE,
+            "Hacktron scan failed: exit code 2",
+            "Audit failed: timeout",
+        ]
+
+        generate_security_mentor_summary(status_lines, ["REACTOR: xss"])
+
+        assert json.loads(captured["user_prompt"])["hacktron_logs"] == []
+
+    def test_real_findings_that_name_the_scanner_are_kept(self, monkeypatch):
+        """The old filter dropped any line containing "hacktron", findings included."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        captured = {}
+        monkeypatch.setattr(
+            claude_client, "_call_claude", lambda **kwargs: captured.update(kwargs) or "ok"
+        )
+        finding = '{"tool": "hacktron", "rule": "sql-injection", "line": 3}'
+
+        generate_security_mentor_summary([finding], ["REACTOR: sqli"])
+
+        assert json.loads(captured["user_prompt"])["hacktron_logs"] == [finding]
+
+    def test_requests_enough_tokens_to_think_and_answer(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        captured = {}
+        monkeypatch.setattr(
+            claude_client, "_call_claude", lambda **kwargs: captured.update(kwargs) or "ok"
+        )
+
+        generate_security_mentor_summary(["log"], ["REACTOR: xss"])
+
+        assert captured["max_tokens"] == claude_client.MAX_TOKENS
 
     def test_response_is_stripped_of_markdown(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "k")

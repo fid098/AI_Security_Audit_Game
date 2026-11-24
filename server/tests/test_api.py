@@ -139,7 +139,7 @@ class TestGenerate:
         assert response.status_code == 503
         assert "unreachable" in response.json()["detail"]
 
-    def test_malformed_upstream_payload_becomes_400(self, client, monkeypatch):
+    def test_malformed_upstream_payload_becomes_502(self, client, monkeypatch):
         def _explode(**kwargs):
             raise ValueError("Claude returned no usable tasks")
 
@@ -155,7 +155,7 @@ class TestGenerate:
             },
         )
 
-        assert response.status_code == 400
+        assert response.status_code == 502
 
     def test_unexpected_failure_does_not_leak_internals(self, client, monkeypatch):
         def _explode(**kwargs):
