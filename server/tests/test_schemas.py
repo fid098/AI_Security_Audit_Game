@@ -5,7 +5,11 @@ from pydantic import ValidationError
 
 from app.schemas import (
     DIFFICULTY_CONFIGS,
+    MAX_AUDIT_TASKS,
+    MAX_CODE_LENGTH,
     AnswerSchema,
+    AuditRequest,
+    FrontendTask,
     GenerateSnippetsRequest,
     SessionCreateRequest,
     TTSRequest,
@@ -69,6 +73,45 @@ class TestAnswerSchema:
     def test_rejects_any_other_choice(self):
         with pytest.raises(ValidationError):
             AnswerSchema(task_id="t1", user_choice="maybe")
+
+
+class TestFrontendTaskBounds:
+    def _task(self, **overrides):
+        fields = {
+            "id": "t1",
+            "systemName": "REACTOR",
+            "code": "x",
+            "language": "javascript",
+            "isVulnerable": True,
+            "vulnerabilityType": "XSS",
+        }
+        return FrontendTask(**{**fields, **overrides})
+
+    @pytest.mark.parametrize("task_id", ["t1", "task-1", "a1b2c3d4e5f6", "snake_case"])
+    def test_accepts_plain_ids(self, task_id):
+        assert self._task(id=task_id).id == task_id
+
+    @pytest.mark.parametrize(
+        "task_id", ["", "../../etc/passwd", "C:/abs", "/abs", "a.b", "a b", "x" * 65]
+    )
+    def test_rejects_ids_that_could_be_paths_or_are_oversized(self, task_id):
+        with pytest.raises(ValidationError):
+            self._task(id=task_id)
+
+    def test_accepts_code_at_the_limit(self):
+        assert len(self._task(code="a" * MAX_CODE_LENGTH).code) == MAX_CODE_LENGTH
+
+    def test_rejects_code_over_the_limit(self):
+        with pytest.raises(ValidationError):
+            self._task(code="a" * (MAX_CODE_LENGTH + 1))
+
+    def test_audit_request_caps_the_number_of_tasks(self):
+        tasks = [self._task(id=f"t{i}") for i in range(MAX_AUDIT_TASKS + 1)]
+
+        with pytest.raises(ValidationError):
+            AuditRequest(tasks=tasks, language="javascript")
+
+        assert len(AuditRequest(tasks=tasks[:-1], language="javascript").tasks) == MAX_AUDIT_TASKS
 
 
 class TestTTSRequest:

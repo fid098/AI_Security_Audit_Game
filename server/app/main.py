@@ -136,19 +136,8 @@ def get_results(session_id: str) -> FinishResponse:
 
 @app.post("/generate", response_model=GenerateSnippetsResponse)
 def generate_snippets(payload: GenerateSnippetsRequest) -> GenerateSnippetsResponse:
-    difficulty_key = payload.difficulty.lower()
-    if difficulty_key not in DIFFICULTY_CONFIGS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid difficulty: {payload.difficulty}. Must be EASY, MEDIUM, or HARD."
-        )
-
-    # Validate count is within reasonable limits (already in schema but enforce here too)
-    if payload.count < 1 or payload.count > 10:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Count must be between 1 and 10."
-        )
+    # The schema already restricts difficulty and count, so both are valid here.
+    config = DIFFICULTY_CONFIGS[payload.difficulty.lower()]
 
     try:
         tasks = generate_frontend_tasks(
@@ -156,8 +145,10 @@ def generate_snippets(payload: GenerateSnippetsRequest) -> GenerateSnippetsRespo
             difficulty=payload.difficulty,
             complexity_level=payload.complexityLevel,
             count=payload.count,
-            vuln_density=DIFFICULTY_CONFIGS[difficulty_key].vuln_density,
+            vuln_density=config.vuln_density,
         )
+        if not config.hints_allowed:
+            tasks = [task.model_copy(update={"hints": None}) for task in tasks]
         return GenerateSnippetsResponse(tasks=tasks)
     except RuntimeError as exc:
         raise HTTPException(

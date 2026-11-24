@@ -17,10 +17,10 @@ from app.store import (
 )
 
 
-def make_session(tasks, answers=None) -> SessionData:
+def make_session(tasks, answers=None, difficulty="easy") -> SessionData:
     return SessionData(
         session_id="s1",
-        difficulty="easy",
+        difficulty=difficulty,
         created_at=datetime(2026, 1, 1),
         tasks=tasks,
         answers=answers or {},
@@ -131,6 +131,18 @@ class TestPublicTaskLeakage:
         assert public[0].id == "t1"
         assert public[0].code == "dangerous()"
         assert public[0].difficulty == "easy"
+
+    @pytest.mark.parametrize(
+        ("difficulty", "expect_hints"), [("easy", True), ("medium", True), ("hard", False)]
+    )
+    def test_hints_follow_the_difficulty_config(self, make_task_schema, difficulty, expect_hints):
+        task = make_task_schema("t1").model_copy(update={"hints": ["check the query"]})
+        store = InMemoryStore()
+        store.sessions["s1"] = make_session([task], difficulty=difficulty)
+
+        hints = store.list_public_tasks("s1")[0].hints
+
+        assert (hints == ["check the query"]) is expect_hints
 
 
 class TestSubmitAnswers:

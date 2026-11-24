@@ -59,6 +59,7 @@ class InMemoryStore:
 
     def list_public_tasks(self, session_id: str) -> list[TaskPublicSchema]:
         session = self.get_session(session_id)
+        hints_allowed = DIFFICULTY_CONFIGS[session.difficulty].hints_allowed
         return [
             TaskPublicSchema(
                 id=task.id,
@@ -66,7 +67,7 @@ class InMemoryStore:
                 code=task.code,
                 difficulty=task.difficulty,
                 language=task.language,
-                hints=task.hints,
+                hints=task.hints if hints_allowed else None,
             )
             for task in session.tasks
         ]
