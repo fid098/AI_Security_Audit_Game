@@ -28,10 +28,12 @@ docker compose up --build
 - Tutorial mode with Claude-generated per-snippet hints, revealed on demand
   (withheld on HARD)
 - Per-task timer, scoring, and ship-system status
-- Hacktron CLI scan of missed tasks only (fast, focused audits)
-- Claude "Security Mentor" post-mortem summary
+- Live Hacktron CLI scan of every missed snippet, run on the server during the
+  audit (missed tasks only, for fast, focused audits)
+- Claude "Security Mentor" post-mortem summary, informed by the scanner output
 - Optional ElevenLabs voice summary, generated on demand from the report
-- Animated audit screen (scan log and progress ring) while the audit runs
+- Audit screen with a scan log and progress ring while the audit runs (the
+  on-screen log is an animation; the real scanner output goes to the summary)
 - Accuracy by vulnerability type in the report
 - Endless mode: 5 easy → 5 medium → hard batches until the first mistake
 
@@ -166,7 +168,7 @@ Pass `--real` to benchmark against an actual configured Hacktron CLI.
 1) Frontend calls `/generate` to get tasks from Claude.
 2) Player marks snippets SAFE/VULNERABLE; the browser scores each answer.
 3) Frontend calls `/audit` with the missed tasks.
-4) Backend runs Hacktron on those snippets.
+4) Backend runs the Hacktron CLI live on each of those snippets, in parallel.
 5) Findings are built from each snippet's labelled vulnerability type; Claude
    writes the mentor summary from those and the scanner output.
 6) The report shows accuracy by vulnerability type; ElevenLabs reads the summary
