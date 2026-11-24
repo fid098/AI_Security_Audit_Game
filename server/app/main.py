@@ -26,7 +26,7 @@ from .schemas import (
     TTSRequest,
     TTSResponse,
 )
-from .store import InMemoryStore
+from .store import InMemoryStore, SessionFinishedError
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
 app = FastAPI(title="Security Sabotage API")
@@ -69,19 +69,32 @@ def landing_page() -> HTMLResponse:
 
 @app.post("/session", response_model=SessionCreateResponse, status_code=status.HTTP_201_CREATED)
 def create_session(payload: SessionCreateRequest) -> SessionCreateResponse:
+    # Same mapping as /generate, which shares the generation path.
     try:
-        session = store.create_session(payload.difficulty, payload.task_count)
-        return SessionCreateResponse(
-            session_id=session.session_id,
-            created_at=session.created_at,
-            difficulty=session.difficulty,
-            config=DIFFICULTY_CONFIGS[session.difficulty],
-        )
-    except Exception as exc:
+        session = store.create_session(payload.difficulty, payload.task_count, payload.language)
+    except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Failed to create session: {str(exc)}"
+            detail=f"Failed to create session: {exc}"
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to create session: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create session. Please try again."
+        ) from exc
+
+    return SessionCreateResponse(
+        session_id=session.session_id,
+        created_at=session.created_at,
+        difficulty=session.difficulty,
+        language=session.language,
+        config=DIFFICULTY_CONFIGS[session.difficulty],
+    )
 
 
 @app.get("/session/{session_id}/tasks", response_model=TaskListResponse)
@@ -104,6 +117,12 @@ def submit_answers(session_id: str, payload: SubmitAnswersRequest) -> SubmitAnsw
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session not found: {session_id}"
+        ) from exc
+    except SessionFinishedError as exc:
+        # 409 Conflict: the request is valid but clashes with the session's state.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc)
         ) from exc
     except ValueError as exc:
         raise HTTPException(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime
 
 import pytest
@@ -9,6 +11,7 @@ from app.schemas import AnswerSchema, TaskPublicSchema
 from app.store import (
     InMemoryStore,
     SessionData,
+    SessionFinishedError,
     _map_complexity,
     _map_vuln_type,
     _to_frontend_difficulty,
@@ -303,3 +306,179 @@ class TestMappings:
     @pytest.mark.parametrize("difficulty", ["easy", "medium", "hard"])
     def test_difficulty_is_upper_cased_for_the_frontend(self, difficulty):
         assert _to_frontend_difficulty(difficulty) == difficulty.upper()
+
+
+class FakeClock:
+    """A controllable stand-in for time.monotonic."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def stub_generation(monkeypatch, make_frontend_task):
+    captured = {}
+
+    def _generate(**kwargs):
+        captured.update(kwargs)
+        return [make_frontend_task("t1")]
+
+    monkeypatch.setattr(store_module, "generate_frontend_tasks", _generate)
+    return captured
+
+
+class TestExpiry:
+    def test_idle_sessions_expire_after_the_ttl(self, stub_generation):
+        clock = FakeClock()
+        store = InMemoryStore(ttl_seconds=60, clock=clock)
+        session_id = store.create_session("easy", 1).session_id
+
+        clock.advance(61)
+
+        with pytest.raises(KeyError):
+            store.get_session(session_id)
+        assert session_id not in store.sessions
+
+    def test_access_refreshes_the_ttl(self, stub_generation):
+        clock = FakeClock()
+        store = InMemoryStore(ttl_seconds=60, clock=clock)
+        session_id = store.create_session("easy", 1).session_id
+
+        for _ in range(5):
+            clock.advance(50)
+            store.get_session(session_id)
+
+        assert store.get_session(session_id).session_id == session_id
+
+    def test_creating_a_session_sweeps_out_expired_ones(self, stub_generation):
+        clock = FakeClock()
+        store = InMemoryStore(ttl_seconds=60, clock=clock)
+        stale = store.create_session("easy", 1).session_id
+
+        clock.advance(61)
+        store.create_session("easy", 1)
+
+        assert stale not in store.sessions
+        assert len(store.sessions) == 1
+
+    def test_the_cap_evicts_the_least_recently_used_session(self, stub_generation):
+        clock = FakeClock()
+        store = InMemoryStore(max_sessions=2, clock=clock)
+        first = store.create_session("easy", 1).session_id
+        clock.advance(1)
+        second = store.create_session("easy", 1).session_id
+        clock.advance(1)
+        store.get_session(first)  # first is now more recent than second
+        clock.advance(1)
+
+        third = store.create_session("easy", 1).session_id
+
+        assert set(store.sessions) == {first, third}
+        assert second not in store.sessions
+
+
+class TestFinishConcurrency:
+    def test_concurrent_finishes_scan_once_and_agree(self, monkeypatch, make_task_schema):
+        """Without the per-session lock, both threads see an unfinished session and scan."""
+        scans = []
+        both_inside = threading.Barrier(2, timeout=5)
+
+        def _scan(payload, language):
+            scans.append(payload)
+            time.sleep(0.2)  # hold the scan open while the other thread arrives
+            return [(task_id, "log") for task_id, _ in payload]
+
+        def _finish(results):
+            both_inside.wait()
+            results.append(store.finish_session("s1"))
+
+        monkeypatch.setattr(store_module, "scan_with_hacktron", _scan)
+        monkeypatch.setattr(
+            store_module, "generate_security_mentor_summary", lambda *a, **k: "summary"
+        )
+        store = InMemoryStore()
+        store.sessions["s1"] = make_session([make_task_schema("t1", is_vulnerable=True)])
+        results = []
+        threads = [threading.Thread(target=_finish, args=(results,)) for _ in range(2)]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert len(scans) == 1
+        assert len(results) == 2
+        assert results[0] == results[1]
+
+    def test_a_perfect_round_is_cached_after_finishing(self, monkeypatch, make_task_schema):
+        """It has no audit logs, which the old cache check mistook for "not finished"."""
+        summaries = []
+        monkeypatch.setattr(
+            store_module,
+            "generate_security_mentor_summary",
+            lambda *a, **k: summaries.append(1) or "summary",
+        )
+        store = InMemoryStore()
+        store.sessions["s1"] = make_session(
+            [make_task_schema("t1", is_vulnerable=True)],
+            {"t1": AnswerSchema(task_id="t1", user_choice="sabotaged")},
+        )
+
+        store.finish_session("s1")
+        store.get_session_results("s1")
+        store.get_session_results("s1")
+
+        assert len(summaries) == 1
+
+
+class TestSubmitAfterFinish:
+    def test_answers_are_rejected_once_finished(self, monkeypatch, make_task_schema):
+        monkeypatch.setattr(store_module, "scan_with_hacktron", lambda *a, **k: [])
+        monkeypatch.setattr(
+            store_module, "generate_security_mentor_summary", lambda *a, **k: "summary"
+        )
+        store = InMemoryStore()
+        store.sessions["s1"] = make_session([make_task_schema("t1", is_vulnerable=True)])
+        store.finish_session("s1")
+
+        with pytest.raises(SessionFinishedError):
+            store.submit_answers("s1", [AnswerSchema(task_id="t1", user_choice="sabotaged")])
+
+        assert store.sessions["s1"].answers == {}
+
+
+class TestSessionLanguage:
+    def test_language_reaches_generation_and_the_session(self, stub_generation):
+        session = InMemoryStore().create_session("easy", 1, "python")
+
+        assert stub_generation["language"] == "python"
+        assert session.language == "python"
+
+    def test_language_defaults_to_javascript(self, stub_generation):
+        assert InMemoryStore().create_session("easy", 1).language == "javascript"
+
+    def test_the_scanner_is_told_the_session_language(self, monkeypatch, make_task_schema):
+        languages = []
+
+        def _scan(payload, language):
+            languages.append(language)
+            return [(task_id, "log") for task_id, _ in payload]
+
+        monkeypatch.setattr(store_module, "scan_with_hacktron", _scan)
+        monkeypatch.setattr(
+            store_module, "generate_security_mentor_summary", lambda *a, **k: "summary"
+        )
+        store = InMemoryStore()
+        session = make_session([make_task_schema("t1", is_vulnerable=True)])
+        session.language = "go"
+        store.sessions["s1"] = session
+
+        store.finish_session("s1")
+
+        assert languages == ["go"]

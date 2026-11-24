@@ -103,12 +103,14 @@ class TaskPublicSchema(BaseModel):
 class SessionCreateRequest(BaseModel):
     difficulty: Difficulty
     task_count: int = Field(ge=1, le=10)
+    language: FrontendLanguage = "javascript"
 
 # response model for session creation with the configured parameters based on difficulty
 class SessionCreateResponse(BaseModel):
     session_id: str
     created_at: datetime
     difficulty: Difficulty
+    language: FrontendLanguage
     config: DifficultyConfig
 
 #response model for listing tasks in a session

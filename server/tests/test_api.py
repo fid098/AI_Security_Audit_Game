@@ -463,6 +463,56 @@ class TestSessionLifecycle:
         assert response.status_code == 400
         assert "Duplicate answer" in response.json()["detail"]
 
+    def test_submitting_after_finish_returns_409(self, client):
+        session_id = client.post(
+            "/session", json={"difficulty": "easy", "task_count": 2}
+        ).json()["session_id"]
+        client.post(f"/session/{session_id}/finish")
+
+        response = client.post(
+            f"/session/{session_id}/submit",
+            json={"answers": [{"task_id": "t1", "user_choice": "sabotaged"}]},
+        )
+
+        assert response.status_code == 409
+        assert "already finished" in response.json()["detail"]
+
+    def test_requested_language_is_echoed_back(self, client):
+        response = client.post(
+            "/session", json={"difficulty": "easy", "task_count": 2, "language": "python"}
+        )
+
+        assert response.status_code == 201
+        assert response.json()["language"] == "python"
+
+    def test_unsupported_language_is_rejected(self, client):
+        response = client.post(
+            "/session", json={"difficulty": "easy", "task_count": 2, "language": "cobol"}
+        )
+
+        assert response.status_code == 422
+
+    def test_malformed_upstream_reply_becomes_502(self, client, monkeypatch):
+        def _explode(**kwargs):
+            raise ValueError("Claude returned 1 tasks, expected 2.")
+
+        monkeypatch.setattr(store_module, "generate_frontend_tasks", _explode)
+
+        response = client.post("/session", json={"difficulty": "easy", "task_count": 2})
+
+        assert response.status_code == 502
+
+    def test_unexpected_failure_does_not_leak_internals(self, client, monkeypatch):
+        def _explode(**kwargs):
+            raise TypeError("secret internal detail")
+
+        monkeypatch.setattr(store_module, "generate_frontend_tasks", _explode)
+
+        response = client.post("/session", json={"difficulty": "easy", "task_count": 2})
+
+        assert response.status_code == 500
+        assert "secret internal detail" not in response.text
+
     def test_out_of_range_task_count_is_rejected(self, client):
         assert client.post("/session", json={"difficulty": "easy", "task_count": 0}).status_code == 422
         assert client.post("/session", json={"difficulty": "easy", "task_count": 11}).status_code == 422
