@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from types import SimpleNamespace
 
 import anthropic
@@ -16,6 +17,7 @@ from app.integrations.claude_client import (
     _normalize_task_item,
     _normalize_vuln_type,
     _parse_json_payload,
+    _sample_vulnerable_target,
     _strip_heading_marks,
     _validate_tasks_payload,
     generate_frontend_tasks,
@@ -188,26 +190,54 @@ class TestValidateTasksPayload:
     def test_accepts_a_matching_payload(self):
         payload = ClaudeTaskPayload(tasks=[task_item(True), task_item(False, "SAFE")])
 
-        assert _validate_tasks_payload(payload, count=2, vuln_density=0.5) is payload
+        assert _validate_tasks_payload(payload, count=2) is payload
 
     def test_rejects_the_wrong_number_of_tasks(self):
         payload = ClaudeTaskPayload(tasks=[task_item()])
 
         with pytest.raises(ValueError, match="expected 3"):
-            _validate_tasks_payload(payload, count=3, vuln_density=0.5)
+            _validate_tasks_payload(payload, count=3)
 
-    def test_rejects_the_wrong_vulnerable_count(self):
-        payload = ClaudeTaskPayload(tasks=[task_item(True), task_item(True)])
+    @pytest.mark.parametrize("vulnerable", [0, 1, 2])
+    def test_any_vulnerable_count_is_accepted(self, vulnerable):
+        """The target is random, so missing it is not worth discarding a paid reply."""
+        tasks = [task_item(i < vulnerable, "XSS" if i < vulnerable else "SAFE") for i in range(2)]
 
-        with pytest.raises(ValueError, match="unexpected vulnerable count"):
-            _validate_tasks_payload(payload, count=2, vuln_density=0.5)
+        assert _validate_tasks_payload(ClaudeTaskPayload(tasks=tasks), count=2).tasks == tasks
 
-    def test_at_least_one_vulnerable_task_is_always_required(self):
-        """max(1, ...) means even a zero density demands one vulnerable snippet."""
-        payload = ClaudeTaskPayload(tasks=[task_item(False, "SAFE")])
 
-        with pytest.raises(ValueError, match="expected 1"):
-            _validate_tasks_payload(payload, count=1, vuln_density=0.0)
+class TestSampleVulnerableTarget:
+    @pytest.mark.parametrize("density", [0.0, 0.4, 0.6, 0.8, 1.0])
+    @pytest.mark.parametrize("count", [1, 3, 5, 10])
+    def test_always_between_one_and_count(self, count, density):
+        rng = random.Random(0)
+
+        draws = [_sample_vulnerable_target(count, density, rng) for _ in range(200)]
+
+        assert all(1 <= n <= count for n in draws)
+
+    def test_zero_density_still_yields_one_vulnerable_snippet(self):
+        assert _sample_vulnerable_target(5, 0.0, random.Random(0)) == 1
+
+    def test_full_density_makes_every_snippet_vulnerable(self):
+        assert _sample_vulnerable_target(5, 1.0, random.Random(0)) == 5
+
+    def test_target_varies_between_rounds(self):
+        """The whole point: a fixed count let players deduce the last answers."""
+        rng = random.Random(0)
+
+        draws = {_sample_vulnerable_target(5, 0.6, rng) for _ in range(200)}
+
+        assert len(draws) >= 3
+
+    @pytest.mark.parametrize("density", [0.4, 0.6, 0.8])
+    def test_average_tracks_the_configured_density(self, density):
+        rng = random.Random(0)
+        count, rounds = 10, 2000
+
+        mean = sum(_sample_vulnerable_target(count, density, rng) for _ in range(rounds)) / rounds
+
+        assert mean == pytest.approx(count * density, abs=0.2)
 
 
 class TestStripHeadingMarks:
@@ -396,6 +426,23 @@ class TestGenerateFrontendTasks:
         tasks = self._generate()
 
         assert [task.systemName for task in tasks] == ["O2", "NAVIGATION"]
+
+    def test_prompt_asks_for_the_sampled_vulnerable_count(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        monkeypatch.setattr(claude_client, "_sample_vulnerable_target", lambda count, density: 4)
+        captured = {}
+
+        def _call(**kwargs):
+            captured.update(kwargs)
+            return json.dumps(
+                {"tasks": [{"code": "a", "isVulnerable": True, "vulnerabilityType": "XSS"}] * 5}
+            )
+
+        monkeypatch.setattr(claude_client, "_call_claude", _call)
+
+        self._generate(count=5, vuln_density=0.6)
+
+        assert "exactly 4 snippets are vulnerable" in captured["user_prompt"]
 
     def test_upstream_count_mismatch_surfaces_as_value_error(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "k")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 from functools import lru_cache
 from itertools import cycle
@@ -81,7 +82,7 @@ def generate_frontend_tasks(
         vuln_density=vuln_density,
     )
 
-    validated = _validate_tasks_payload(payload, count, vuln_density)
+    validated = _validate_tasks_payload(payload, count)
     tasks: list[FrontendTask] = []
     system_cycle = cycle(SYSTEM_NAMES)
 
@@ -162,7 +163,7 @@ def _request_tasks_from_claude(
 
     model = os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
 
-    vulnerable_target = max(1, round(count * vuln_density))
+    vulnerable_target = _sample_vulnerable_target(count, vuln_density)
     system_prompt = (
         "You generate short code snippets for a security training game. "
         "Return strict JSON with a top-level 'tasks' array. "
@@ -258,23 +259,28 @@ def _parse_json_payload(text: str) -> ClaudeTaskPayload:
         raise ValueError(f"Claude JSON validation failed: {exc}") from exc
 
 
-def _validate_tasks_payload(
-    payload: ClaudeTaskPayload,
-    count: int,
-    vuln_density: float,
-) -> ClaudeTaskPayload:
+def _validate_tasks_payload(payload: ClaudeTaskPayload, count: int) -> ClaudeTaskPayload:
+    # The vulnerable count is deliberately not checked: the target is random
+    # (see _sample_vulnerable_target), so a reply that misses it by one is just
+    # another valid round, not a reason to throw away a paid call.
     if len(payload.tasks) != count:
         raise ValueError(f"Claude returned {len(payload.tasks)} tasks, expected {count}.")
-
-    vulnerable_target = max(1, round(count * vuln_density))
-    vulnerable_count = sum(1 for task in payload.tasks if task.isVulnerable)
-    if vulnerable_count != vulnerable_target:
-        raise ValueError(
-            "Claude returned an unexpected vulnerable count: "
-            f"{vulnerable_count} (expected {vulnerable_target})."
-        )
-
     return payload
+
+
+def _sample_vulnerable_target(
+    count: int, vuln_density: float, rng: random.Random | None = None
+) -> int:
+    """How many of `count` snippets should be vulnerable this round.
+
+    Each snippet is vulnerable with probability `vuln_density` (a binomial
+    draw). A fixed round(count * density) let players who knew the density
+    deduce the last answers by counting. At least one is always vulnerable so
+    every round has something to find.
+    """
+    rng = rng or random
+    drawn = sum(1 for _ in range(count) if rng.random() < vuln_density)
+    return max(1, drawn)
 
 
 def _normalize_vuln_type(is_vulnerable: bool, vuln_type: FrontendVulnType) -> FrontendVulnType:
