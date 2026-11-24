@@ -1,4 +1,4 @@
-import { useRef, useCallback, useEffect } from 'react';
+import { useRef, useCallback, useEffect, useMemo } from 'react';
 
 type SoundEffect = 'siren' | 'success' | 'click' | 'warning' | 'tick';
 
@@ -181,15 +181,18 @@ export function useAudio() {
     };
   }, [stopAll]);
 
-  return {
-    play: playSynthSound,
-    playUrl: playAudioUrl,
-    stopAll,
-    setMuted,
-    setVolume,
-    isMuted: isMutedRef.current,
-    volume: volumeRef.current,
-  };
+  // Memoised so callers can list the player as an effect dependency without
+  // re-running the effect on every render.
+  return useMemo(
+    () => ({
+      play: playSynthSound,
+      playUrl: playAudioUrl,
+      stopAll,
+      setMuted,
+      setVolume,
+    }),
+    [playSynthSound, playAudioUrl, stopAll, setMuted, setVolume]
+  );
 }
 
 export type AudioPlayer = ReturnType<typeof useAudio>;

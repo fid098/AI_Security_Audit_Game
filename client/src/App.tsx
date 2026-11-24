@@ -1,6 +1,6 @@
 import { useEffect, useCallback, useState } from "react";
 import { useGameState, useAudio } from "./hooks";
-import { claudeService, hacktronService, elevenlabsService } from "./services";
+import { claudeService, hacktronService } from "./services";
 import { calculateGameConfig } from "./types";
 import type { Difficulty, DifficultyFactors, Language, Task } from "./types";
 
@@ -11,7 +11,6 @@ import { GameScreen } from "./components/GameScreen/GameScreen";
 import { EmergencyOverlay } from "./components/EmergencyOverlay/EmergencyOverlay";
 import { ReportModal } from "./components/ReportModal/ReportModal";
 import { LoadingOverlay } from "./components/LoadingOverlay/LoadingOverlay";
-//import { ScanLogOverlay } from "./components/ScanLogOverlay/ScanLogOverlay";
 import { AuditSplitScreen } from "./components/AuditSplitScreen/AuditSplitScreen";
 import { GameInfoModal } from "./components/GameInfoModal/GameInfoModal";
 
@@ -217,31 +216,16 @@ function App() {
         language: state.language,
       });
 
+      // Voice audio is not generated here: the report offers it on demand, so
+      // the debrief is not held up by a TTS round trip nobody may want.
       if (auditResult.success) {
-        // Try to generate audio for the summary
-        const audioResult = await elevenlabsService.generateReportAudio(
-          auditResult.data.report.summary
-        );
-
-        actions.setAuditReport({
-          ...auditResult.data.report,
-          audioUrl: audioResult.success ? audioResult.data.audioUrl : undefined,
-        });
+        actions.setAuditReport(auditResult.data.report);
       }
     } else {
-      // No failed tasks, create empty report with audio
-      const perfectScoreSummary =
-        "Excellent work! All security checks passed successfully. Ship systems are secure.";
-
-      // Generate audio for perfect score too
-      const audioResult = await elevenlabsService.generateReportAudio(
-        perfectScoreSummary
-      );
-
       actions.setAuditReport({
         findings: [],
-        summary: perfectScoreSummary,
-        audioUrl: audioResult.success ? audioResult.data.audioUrl : undefined,
+        summary:
+          "Excellent work! All security checks passed successfully. Ship systems are secure.",
       });
     }
 
