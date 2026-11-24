@@ -8,9 +8,9 @@ services:
       # breaking the app. See README "Running without API keys".
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
-      ANTHROPIC_VERSION: ${ANTHROPIC_VERSION:-2023-06-01}
       ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
       ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+      ELEVENLABS_MODEL_ID: ${ELEVENLABS_MODEL_ID:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8080}
       # Left unset by default: the CLI is not present in the image.
       HACKTRON_CMD: ${HACKTRON_CMD:-}

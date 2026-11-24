@@ -48,12 +48,6 @@ def fake_client(response=None, raises=None):
     return _Client
 
 
-@pytest.fixture(autouse=True)
-def block_dotenv_fallback(monkeypatch):
-    """_get_api_key falls back to loading the repo .env, which would leak a real key."""
-    monkeypatch.setattr(elevenlabs_module, "load_dotenv", lambda *args, **kwargs: False)
-
-
 class TestValidateApiKey:
     def test_missing_key_is_reported_without_a_request(self, monkeypatch):
         monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
@@ -181,3 +175,58 @@ class TestGenerateSpeech:
 
         with pytest.raises(RuntimeError, match="Failed to connect"):
             generate_speech("hello")
+
+    def test_upstream_error_body_is_not_passed_on(self, monkeypatch):
+        """This message becomes the API's 503 detail, so it must not echo the provider."""
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "k")
+        monkeypatch.setattr(
+            elevenlabs_module.httpx,
+            "Client",
+            fake_client(FakeResponse(status_code=500, text="internal trace id=abc123")),
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            generate_speech("hello")
+
+        assert "abc123" not in str(excinfo.value)
+
+
+class TestConfiguration:
+    def _capture(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "k")
+        client_cls = fake_client(FakeResponse(content=b"a"))
+        monkeypatch.setattr(elevenlabs_module.httpx, "Client", client_cls)
+        return client_cls
+
+    def test_configured_voice_replaces_the_built_in_one(self, monkeypatch):
+        client_cls = self._capture(monkeypatch)
+        monkeypatch.setenv("ELEVENLABS_VOICE_ID", "myVoice123")
+
+        generate_speech("hello", voice_id="ship_computer")
+
+        assert client_cls.last_url.endswith("/text-to-speech/myVoice123")
+
+    def test_built_in_voice_is_used_when_none_is_configured(self, monkeypatch):
+        client_cls = self._capture(monkeypatch)
+
+        generate_speech("hello")
+
+        assert client_cls.last_url.endswith(VOICE_IDS["default"])
+
+    def test_model_defaults_and_can_be_overridden(self, monkeypatch):
+        client_cls = self._capture(monkeypatch)
+
+        generate_speech("hello")
+        assert client_cls.last_json["model_id"] == elevenlabs_module.DEFAULT_MODEL_ID
+
+        monkeypatch.setenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+        generate_speech("hello")
+        assert client_cls.last_json["model_id"] == "eleven_multilingual_v2"
+
+    def test_api_key_comes_only_from_the_environment(self, monkeypatch, tmp_path):
+        """A .env in the working directory must not be read mid-request."""
+        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+        (tmp_path / ".env").write_text("ELEVENLABS_API_KEY=from-file\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        assert elevenlabs_module._get_api_key() is None

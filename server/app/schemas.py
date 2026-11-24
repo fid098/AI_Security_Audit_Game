@@ -103,12 +103,14 @@ class TaskPublicSchema(BaseModel):
 class SessionCreateRequest(BaseModel):
     difficulty: Difficulty
     task_count: int = Field(ge=1, le=10)
+    language: FrontendLanguage = "javascript"
 
 # response model for session creation with the configured parameters based on difficulty
 class SessionCreateResponse(BaseModel):
     session_id: str
     created_at: datetime
     difficulty: Difficulty
+    language: FrontendLanguage
     config: DifficultyConfig
 
 #response model for listing tasks in a session
@@ -156,11 +158,17 @@ class GenerateSnippetsRequest(BaseModel):
     complexityLevel: Literal["basic", "intermediate", "advanced"]
     count: int = Field(ge=1, le=10)
 
+# Bounds on client-supplied tasks. /audit writes each snippet to disk and hands
+# it to a scanner, so unbounded input would let one request cost unbounded work.
+MAX_TASK_ID_LENGTH = 64
+MAX_CODE_LENGTH = 4000
+MAX_AUDIT_TASKS = 10
+
 # model for each frontend task
 class FrontendTask(BaseModel):
-    id: str
+    id: str = Field(min_length=1, max_length=MAX_TASK_ID_LENGTH, pattern=r"^[A-Za-z0-9_-]+$")
     systemName: FrontendSystemName
-    code: str
+    code: str = Field(max_length=MAX_CODE_LENGTH)
     language: FrontendLanguage
     isVulnerable: bool
     vulnerabilityType: FrontendVulnType
@@ -193,7 +201,7 @@ class AuditReport(BaseModel):
 
 # request model for auditing tasks
 class AuditRequest(BaseModel):
-    tasks: list[FrontendTask]
+    tasks: list[FrontendTask] = Field(max_length=MAX_AUDIT_TASKS)
     language: FrontendLanguage
 
 # response model for audit report

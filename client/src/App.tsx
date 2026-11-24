@@ -1,8 +1,8 @@
 import { useEffect, useCallback, useState } from "react";
 import { useGameState, useAudio } from "./hooks";
-import { claudeService, hacktronService, elevenlabsService } from "./services";
+import { claudeService, hacktronService } from "./services";
 import { calculateGameConfig } from "./types";
-import type { Difficulty, DifficultyFactors, Language } from "./types";
+import type { Difficulty, DifficultyFactors, Language, Task } from "./types";
 
 // Components
 import { HomePage } from "./components/HomePage/HomePage";
@@ -11,20 +11,35 @@ import { GameScreen } from "./components/GameScreen/GameScreen";
 import { EmergencyOverlay } from "./components/EmergencyOverlay/EmergencyOverlay";
 import { ReportModal } from "./components/ReportModal/ReportModal";
 import { LoadingOverlay } from "./components/LoadingOverlay/LoadingOverlay";
-//import { ScanLogOverlay } from "./components/ScanLogOverlay/ScanLogOverlay";
 import { AuditSplitScreen } from "./components/AuditSplitScreen/AuditSplitScreen";
 import { GameInfoModal } from "./components/GameInfoModal/GameInfoModal";
 
 import "./App.css";
 
+// Tasks sent for audit: everything the player got wrong, plus (outside endless
+// mode) vulnerable tasks they never reached.
+function selectTasksToAudit(tasks: Task[], endlessMode: boolean): Task[] {
+  return endlessMode
+    ? tasks.filter((t) => t.status === "failed")
+    : tasks.filter(
+        (t) => t.status === "failed" || (t.isVulnerable && t.status !== "completed")
+      );
+}
+
 function App() {
   const { state, currentTask, failedTasks, actions } = useGameState();
   const audio = useAudio();
-  const [showEmergency, setShowEmergency] = useState(false);
   const [showGameInfo, setShowGameInfo] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [tutorialMode, setTutorialMode] = useState(false);
   const [endlessStage, setEndlessStage] = useState<Difficulty>('EASY');
+  const [generationError, setGenerationError] = useState<string | null>(null);
+
+  // Every way a round ends (timeout, wrong answer, last task) leaves the
+  // reducer in AUDITING with a reason, so the overlay is derived from that
+  // rather than tracked separately, where it could drift out of sync.
+  const showEmergency =
+    state.phase === "AUDITING" && !!state.gameOverReason && !state.auditStarted;
 
   // Timer effect
   useEffect(() => {
@@ -44,7 +59,6 @@ function App() {
     if (state.timeRemaining <= 0) {
       audio.play("warning");
       actions.timeUp();
-      setShowEmergency(true);
     } else if (state.timeRemaining <= 5) {
       // Play tick sound when time is low
       audio.play("tick");
@@ -78,6 +92,7 @@ function App() {
       actions.setLanguage(language);
       actions.startLoading();
 
+      setGenerationError(null);
       setIsGenerating(true);
       const result = state.endlessMode
         ? await generateEndlessBatch('EASY', factors, language)
@@ -96,9 +111,9 @@ function App() {
         }
         audio.play("click");
       } else {
+        // Stay on difficulty select so the player keeps their settings and can retry.
         console.error("Failed to generate snippets:", result.error);
-        // Show error state or retry
-        actions.resetGame();
+        setGenerationError(result.error.message);
       }
       setIsGenerating(false);
     },
@@ -118,7 +133,6 @@ function App() {
         audio.play("siren");
         actions.answerTask(answer);
         actions.gameOver("wrong_answer");
-        setShowEmergency(true);
         return;
       }
 
@@ -154,7 +168,7 @@ function App() {
                 actions.startPlaying();
               } else {
                 console.error("Failed to generate snippets:", result.error);
-                actions.resetGame();
+                setGenerationError(result.error.message);
               }
               setIsGenerating(false);
             }
@@ -162,18 +176,12 @@ function App() {
           return;
         }
       }
-
-      // Check if game is complete
-      if (isLastTask) {
-        setShowEmergency(true);
-      }
     },
     [
       currentTask,
       actions,
       audio,
       state.currentTaskIndex,
-      state.tasks.length,
       state.endlessMode,
       state.tasks,
       state.difficultyFactors,
@@ -185,18 +193,10 @@ function App() {
 
   // Handle continue from emergency overlay
   const handleContinueFromEmergency = useCallback(async () => {
-    setShowEmergency(false);
-
-    // Start auditing
+    // Marks the audit as started, which also dismisses the overlay.
     actions.startAuditing();
 
-    // Audit failed tasks
-    const tasksToAudit = state.endlessMode
-      ? state.tasks.filter((t) => t.status === "failed")
-      : state.tasks.filter(
-          (t) =>
-            t.status === "failed" || (t.isVulnerable && t.status !== "completed")
-        );
+    const tasksToAudit = selectTasksToAudit(state.tasks, state.endlessMode);
 
     if (tasksToAudit.length > 0) {
       const auditResult = await hacktronService.auditTasks({
@@ -204,47 +204,34 @@ function App() {
         language: state.language,
       });
 
+      // Voice audio is not generated here: the report offers it on demand, so
+      // the debrief is not held up by a TTS round trip nobody may want.
       if (auditResult.success) {
-        // Try to generate audio for the summary
-        const audioResult = await elevenlabsService.generateReportAudio(
-          auditResult.data.report.summary
-        );
-
-        actions.setAuditReport({
-          ...auditResult.data.report,
-          audioUrl: audioResult.success ? audioResult.data.audioUrl : undefined,
-        });
+        actions.setAuditReport(auditResult.data.report);
       }
     } else {
-      // No failed tasks, create empty report with audio
-      const perfectScoreSummary =
-        "Excellent work! All security checks passed successfully. Ship systems are secure.";
-
-      // Generate audio for perfect score too
-      const audioResult = await elevenlabsService.generateReportAudio(
-        perfectScoreSummary
-      );
-
       actions.setAuditReport({
         findings: [],
-        summary: perfectScoreSummary,
-        audioUrl: audioResult.success ? audioResult.data.audioUrl : undefined,
+        summary:
+          "Excellent work! All security checks passed successfully. Ship systems are secure.",
       });
     }
 
     // Move to debrief
     actions.startDebrief();
-  }, [actions, state.tasks, state.language]);
+  }, [actions, state.tasks, state.language, state.endlessMode]);
 
   // Handle restart
   const handleRestart = useCallback(() => {
     audio.stopAll();
+    setGenerationError(null);
     actions.resetGame();
   }, [actions, audio]);
 
   // Handle play button on home
   const handlePlay = useCallback(() => {
     audio.play("click");
+    setGenerationError(null);
     actions.resetGame();
     actions.startLoading();
   }, [actions, audio]);
@@ -282,6 +269,14 @@ function App() {
           }
           return (
             <>
+              {generationError && (
+                <div className="app-error" role="alert">
+                  <span>MISSION GENERATION FAILED: {generationError}</span>
+                  <button onClick={() => setGenerationError(null)} aria-label="Dismiss">
+                    ×
+                  </button>
+                </div>
+              )}
               <DifficultySelect
                 initialDifficulty={state.difficulty}
                 initialFactors={state.difficultyFactors}
@@ -320,27 +315,16 @@ function App() {
 
       case "PLAYING":
         return (
-          <>
-            <GameScreen
-              tasks={state.tasks}
-              currentTaskIndex={state.currentTaskIndex}
-              currentTask={currentTask}
-              language={state.language}
-              timeRemaining={state.timeRemaining}
-              timePerTask={state.timePerTask}
-              onAnswer={handleAnswer}
-              showTutorial={tutorialMode}
-            />
-            {showEmergency && state.gameOverReason && (
-              <EmergencyOverlay
-                reason={state.gameOverReason}
-                onContinue={handleContinueFromEmergency}
-                score={state.score}
-                totalTasks={state.tasks.length}
-                correctAnswers={state.totalCorrect}
-              />
-            )}
-          </>
+          <GameScreen
+            tasks={state.tasks}
+            currentTaskIndex={state.currentTaskIndex}
+            currentTask={currentTask}
+            language={state.language}
+            timeRemaining={state.timeRemaining}
+            timePerTask={state.timePerTask}
+            onAnswer={handleAnswer}
+            showTutorial={tutorialMode}
+          />
         );
 
       case "AUDITING":
@@ -357,10 +341,15 @@ function App() {
               disabled
               showTutorial={tutorialMode}
             />
-            {!state.auditReport && (
+            {/* Only once the audit has started; until then the emergency
+                overlay is up and the scan has not begun. */}
+            {!state.auditReport && !showEmergency && (
               <AuditSplitScreen
-                active={!state.auditReport}
-                findingsCount={state.tasks.filter((t) => t.isVulnerable).length}
+                findingsCount={
+                  selectTasksToAudit(state.tasks, state.endlessMode).filter(
+                    (t) => t.isVulnerable
+                  ).length
+                }
               />
             )}
             {showGameInfo && (

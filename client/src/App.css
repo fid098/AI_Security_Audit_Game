@@ -6,6 +6,35 @@
   background: var(--bg-primary);
 }
 
+/* Banner shown on difficulty select when snippet generation fails */
+.app-error {
+  position: fixed;
+  top: var(--spacing-md);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  max-width: min(90vw, 720px);
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--bg-secondary);
+  border: 1px solid var(--danger-red);
+  border-radius: var(--radius-md);
+  box-shadow: var(--danger-glow);
+  color: var(--danger-red);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+.app-error button {
+  background: none;
+  border: none;
+  color: var(--danger-red);
+  font-size: 1.2rem;
+  cursor: pointer;
+}
+
 /* Override #root styles */
 #root {
   max-width: none;

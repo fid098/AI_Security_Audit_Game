@@ -3,10 +3,8 @@ ElevenLabs Text-to-Speech Integration
 """
 import base64
 import os
-from pathlib import Path
 
 import httpx
-from dotenv import load_dotenv
 
 ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1"
 
@@ -15,6 +13,8 @@ VOICE_IDS = {
     "ship_computer": "EXAVITQu4vr4xnSDxMaL",  # Sarah - clear, professional
     "default": "EXAVITQu4vr4xnSDxMaL",
 }
+
+DEFAULT_MODEL_ID = "eleven_monolingual_v1"
 
 
 def validate_api_key() -> tuple[bool, str]:
@@ -69,10 +69,7 @@ def generate_speech(text: str, voice_id: str | None = None) -> tuple[str, float]
     if not api_key:
         raise RuntimeError("ELEVENLABS_API_KEY not configured in environment")
 
-    # Map voice presets to actual voice IDs
-    actual_voice_id = VOICE_IDS.get(voice_id or "default", VOICE_IDS["default"])
-
-    url = f"{ELEVENLABS_API_URL}/text-to-speech/{actual_voice_id}"
+    url = f"{ELEVENLABS_API_URL}/text-to-speech/{_resolve_voice_id(voice_id)}"
 
     headers = {
         "Accept": "audio/mpeg",
@@ -82,7 +79,7 @@ def generate_speech(text: str, voice_id: str | None = None) -> tuple[str, float]
 
     data = {
         "text": text,
-        "model_id": "eleven_monolingual_v1",
+        "model_id": os.getenv("ELEVENLABS_MODEL_ID") or DEFAULT_MODEL_ID,
         "voice_settings": {
             "stability": 0.5,
             "similarity_boost": 0.75,
@@ -124,7 +121,8 @@ def generate_speech(text: str, voice_id: str | None = None) -> tuple[str, float]
         elif status_code == 403:
             raise RuntimeError("ElevenLabs API access forbidden. Check your subscription and permissions.") from exc
         else:
-            raise RuntimeError(f"ElevenLabs API error: {status_code} - {exc.response.text}") from exc
+            # The upstream body is left out: this message reaches the client.
+            raise RuntimeError(f"ElevenLabs API error: {status_code}") from exc
     except httpx.RequestError as exc:
         raise RuntimeError(f"Failed to connect to ElevenLabs API. Check your internet connection: {str(exc)}") from exc
     except Exception as exc:
@@ -132,9 +130,16 @@ def generate_speech(text: str, voice_id: str | None = None) -> tuple[str, float]
 
 
 def _get_api_key() -> str | None:
-    api_key = os.getenv("ELEVENLABS_API_KEY")
-    if api_key:
-        return api_key
-    # Load repo-level .env for uvicorn reload processes.
-    load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=True)
+    # .env is loaded once at startup by app.main; re-reading it here on every
+    # call silently overwrote the environment mid-request.
     return os.getenv("ELEVENLABS_API_KEY")
+
+
+def _resolve_voice_id(voice_id: str | None) -> str:
+    # Callers pass a preset name, never a raw ID, so a client cannot inject an
+    # arbitrary path into the request URL. ELEVENLABS_VOICE_ID swaps in a
+    # different voice for every preset.
+    configured = os.getenv("ELEVENLABS_VOICE_ID")
+    if configured:
+        return configured
+    return VOICE_IDS.get(voice_id or "default", VOICE_IDS["default"])

@@ -4,7 +4,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 
 from .integrations.claude_client import generate_frontend_tasks, generate_security_mentor_summary
 from .integrations.elevenlabs import generate_speech, validate_api_key
@@ -26,21 +25,24 @@ from .schemas import (
     TTSRequest,
     TTSResponse,
 )
-from .store import InMemoryStore
+from .store import InMemoryStore, SessionFinishedError
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
+# Fills in settings missing from the environment, for local development. Real
+# environment variables win, so values set by Docker or CI are never replaced
+# by a stale .env file.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 app = FastAPI(title="Security Sabotage API")
 store = InMemoryStore()
-
-CLIENT_INDEX_PATH = Path(__file__).resolve().parents[2] / "client" / "index.html"
 
 cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in cors_origins if origin.strip()],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # The app uses no cookies or HTTP auth, so browsers need not send them.
+    allow_credentials=False,
+    # Only what the client actually sends.
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -60,28 +62,46 @@ def elevenlabs_health() -> dict:
     }
 
 
-@app.get("/", response_class=HTMLResponse)
-def landing_page() -> HTMLResponse:
-    if CLIENT_INDEX_PATH.exists():
-        return HTMLResponse(CLIENT_INDEX_PATH.read_text(encoding="utf-8"))
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client landing page not found.")
+@app.get("/")
+def index() -> dict:
+    # The game itself is served by the client (Vite in development, nginx in
+    # Docker). This used to return client/index.html, which is the unbuilt dev
+    # source and could not load from here, and was absent in the image.
+    return {
+        "service": app.title,
+        "docs": app.docs_url,
+        "health": "/health",
+    }
 
 
 @app.post("/session", response_model=SessionCreateResponse, status_code=status.HTTP_201_CREATED)
 def create_session(payload: SessionCreateRequest) -> SessionCreateResponse:
+    # Same mapping as /generate, which shares the generation path.
     try:
-        session = store.create_session(payload.difficulty, payload.task_count)
-        return SessionCreateResponse(
-            session_id=session.session_id,
-            created_at=session.created_at,
-            difficulty=session.difficulty,
-            config=DIFFICULTY_CONFIGS[session.difficulty],
-        )
-    except Exception as exc:
+        session = store.create_session(payload.difficulty, payload.task_count, payload.language)
+    except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Failed to create session: {str(exc)}"
+            detail=f"Failed to create session: {exc}"
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to create session: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create session. Please try again."
+        ) from exc
+
+    return SessionCreateResponse(
+        session_id=session.session_id,
+        created_at=session.created_at,
+        difficulty=session.difficulty,
+        language=session.language,
+        config=DIFFICULTY_CONFIGS[session.difficulty],
+    )
 
 
 @app.get("/session/{session_id}/tasks", response_model=TaskListResponse)
@@ -104,6 +124,12 @@ def submit_answers(session_id: str, payload: SubmitAnswersRequest) -> SubmitAnsw
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session not found: {session_id}"
+        ) from exc
+    except SessionFinishedError as exc:
+        # 409 Conflict: the request is valid but clashes with the session's state.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc)
         ) from exc
     except ValueError as exc:
         raise HTTPException(
@@ -136,19 +162,8 @@ def get_results(session_id: str) -> FinishResponse:
 
 @app.post("/generate", response_model=GenerateSnippetsResponse)
 def generate_snippets(payload: GenerateSnippetsRequest) -> GenerateSnippetsResponse:
-    difficulty_key = payload.difficulty.lower()
-    if difficulty_key not in DIFFICULTY_CONFIGS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid difficulty: {payload.difficulty}. Must be EASY, MEDIUM, or HARD."
-        )
-
-    # Validate count is within reasonable limits (already in schema but enforce here too)
-    if payload.count < 1 or payload.count > 10:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Count must be between 1 and 10."
-        )
+    # The schema already restricts difficulty and count, so both are valid here.
+    config = DIFFICULTY_CONFIGS[payload.difficulty.lower()]
 
     try:
         tasks = generate_frontend_tasks(
@@ -156,8 +171,10 @@ def generate_snippets(payload: GenerateSnippetsRequest) -> GenerateSnippetsRespo
             difficulty=payload.difficulty,
             complexity_level=payload.complexityLevel,
             count=payload.count,
-            vuln_density=DIFFICULTY_CONFIGS[difficulty_key].vuln_density,
+            vuln_density=config.vuln_density,
         )
+        if not config.hints_allowed:
+            tasks = [task.model_copy(update={"hints": None}) for task in tasks]
         return GenerateSnippetsResponse(tasks=tasks)
     except RuntimeError as exc:
         raise HTTPException(
@@ -165,8 +182,10 @@ def generate_snippets(payload: GenerateSnippetsRequest) -> GenerateSnippetsRespo
             detail=str(exc)
         ) from exc
     except ValueError as exc:
+        # The request was valid; Claude's reply was not. That is an upstream
+        # fault, so 502 rather than a 400 that blames the caller.
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(exc)
         ) from exc
     except Exception as exc:

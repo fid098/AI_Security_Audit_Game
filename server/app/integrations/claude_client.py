@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
+from functools import lru_cache
 from itertools import cycle
 from uuid import uuid4
 
-import httpx
+import anthropic
 from pydantic import BaseModel, ValidationError
 
 from ..schemas import (
@@ -16,6 +18,27 @@ from ..schemas import (
     FrontendTask,
     FrontendVulnType,
 )
+from .hacktron import NOT_CONFIGURED_MESSAGE
+
+# Matches docker-compose and the README; override with ANTHROPIC_MODEL.
+DEFAULT_MODEL = "claude-sonnet-5"
+
+# Current models think before answering, and thinking tokens count against
+# max_tokens, so a small cap can be spent before any text is written. Billing
+# is for tokens used, not the cap, so the cap is generous.
+MAX_TOKENS = 16000
+
+# Thinking makes calls slower than the old 30s budget allowed.
+REQUEST_TIMEOUT_SECONDS = 120
+
+# Retries on top of the first attempt for transient failures (429, 5xx,
+# connection errors). Worst-case wall time is the timeout times (retries + 1).
+MAX_RETRIES = 3
+
+# Log lines that describe the scanner's own state rather than the code. They
+# are produced by hacktron.scan_with_hacktron, main.audit_tasks and
+# store.finish_session.
+SCANNER_STATUS_PREFIXES = (NOT_CONFIGURED_MESSAGE, "Hacktron scan failed:", "Audit failed:")
 
 SYSTEM_NAMES: list[FrontendSystemName] = [
     "O2",
@@ -59,7 +82,7 @@ def generate_frontend_tasks(
         vuln_density=vuln_density,
     )
 
-    validated = _validate_tasks_payload(payload, count, vuln_density)
+    validated = _validate_tasks_payload(payload, count)
     tasks: list[FrontendTask] = []
     system_cycle = cycle(SYSTEM_NAMES)
 
@@ -95,8 +118,7 @@ def generate_security_mentor_summary(
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not configured.")
 
-    model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620")
-    version = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
+    model = os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
 
     system_prompt = (
         "You are the Security Mentor. Provide a 3-sentence post-mortem summary focused "
@@ -106,8 +128,11 @@ def generate_security_mentor_summary(
         "Be concise and technical."
     )
 
+    # Drop the scanner's own status messages (not configured, failed) so the
+    # mentor does not talk about tooling. Real findings are kept even when they
+    # happen to mention the scanner by name.
     filtered_logs = [
-        log for log in hacktron_logs if "hacktron" not in log.lower()
+        log for log in hacktron_logs if not log.startswith(SCANNER_STATUS_PREFIXES)
     ]
     user_prompt = {
         "failed_tasks": failed_task_summaries,
@@ -117,10 +142,9 @@ def generate_security_mentor_summary(
     response = _call_claude(
         api_key=api_key,
         model=model,
-        version=version,
         system_prompt=system_prompt,
         user_prompt=json.dumps(user_prompt),
-        max_tokens=220,
+        max_tokens=MAX_TOKENS,
     )
 
     return _strip_heading_marks(response)
@@ -137,10 +161,9 @@ def _request_tasks_from_claude(
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not configured.")
 
-    model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620")
-    version = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
+    model = os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
 
-    vulnerable_target = max(1, round(count * vuln_density))
+    vulnerable_target = _sample_vulnerable_target(count, vuln_density)
     system_prompt = (
         "You generate short code snippets for a security training game. "
         "Return strict JSON with a top-level 'tasks' array. "
@@ -162,55 +185,58 @@ def _request_tasks_from_claude(
     response = _call_claude(
         api_key=api_key,
         model=model,
-        version=version,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        max_tokens=1400,
+        max_tokens=MAX_TOKENS,
     )
 
     return _parse_json_payload(response)
 
 
+@lru_cache(maxsize=4)
+def _client(api_key: str) -> anthropic.Anthropic:
+    # One client per key, reused across requests so its connection pool is too.
+    # The SDK retries connection errors, 408, 409, 429 and 5xx with exponential
+    # backoff, honouring the server's retry-after header.
+    return anthropic.Anthropic(
+        api_key=api_key,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        max_retries=MAX_RETRIES,
+    )
+
+
 def _call_claude(
     api_key: str,
     model: str,
-    version: str,
     system_prompt: str,
     user_prompt: str,
     max_tokens: int,
 ) -> str:
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": version,
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-
     try:
-        with httpx.Client(timeout=30) as client:
-            response = client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-    except httpx.TimeoutException as exc:
+        message = _client(api_key).messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+    # These are raised only once the SDK's retries are exhausted. The timeout
+    # check comes first because APITimeoutError subclasses APIConnectionError.
+    except anthropic.APITimeoutError as exc:
         raise RuntimeError("Claude API request timed out") from exc
-    except httpx.HTTPStatusError as exc:
-        raise RuntimeError(f"Claude API error: {exc.response.status_code}") from exc
-    except httpx.RequestError as exc:
-        raise RuntimeError(f"Claude API connection failed: {str(exc)}") from exc
+    except anthropic.APIConnectionError as exc:
+        raise RuntimeError(f"Claude API connection failed: {exc}") from exc
+    except anthropic.APIStatusError as exc:
+        raise RuntimeError(f"Claude API error: {exc.status_code}") from exc
 
-    if isinstance(data, dict) and "content" in data:
-        parts = data.get("content") or []
-        text_chunks = [part.get("text", "") for part in parts if isinstance(part, dict)]
-        return "\n".join(text_chunks).strip()
+    # A truncated or refused reply would otherwise reach the JSON parser and
+    # surface as a confusing parse error.
+    if message.stop_reason == "max_tokens":
+        raise RuntimeError("Claude response was truncated (max_tokens reached)")
+    if message.stop_reason == "refusal":
+        raise RuntimeError("Claude declined the request")
 
-    return json.dumps(data)
+    # Thinking blocks carry no answer text; only text blocks do.
+    return "\n".join(block.text for block in message.content if block.type == "text").strip()
 
 # Helper to parse and validate Claude JSON response
 def _parse_json_payload(text: str) -> ClaudeTaskPayload:
@@ -233,23 +259,28 @@ def _parse_json_payload(text: str) -> ClaudeTaskPayload:
         raise ValueError(f"Claude JSON validation failed: {exc}") from exc
 
 
-def _validate_tasks_payload(
-    payload: ClaudeTaskPayload,
-    count: int,
-    vuln_density: float,
-) -> ClaudeTaskPayload:
+def _validate_tasks_payload(payload: ClaudeTaskPayload, count: int) -> ClaudeTaskPayload:
+    # The vulnerable count is deliberately not checked: the target is random
+    # (see _sample_vulnerable_target), so a reply that misses it by one is just
+    # another valid round, not a reason to throw away a paid call.
     if len(payload.tasks) != count:
         raise ValueError(f"Claude returned {len(payload.tasks)} tasks, expected {count}.")
-
-    vulnerable_target = max(1, round(count * vuln_density))
-    vulnerable_count = sum(1 for task in payload.tasks if task.isVulnerable)
-    if vulnerable_count != vulnerable_target:
-        raise ValueError(
-            "Claude returned an unexpected vulnerable count: "
-            f"{vulnerable_count} (expected {vulnerable_target})."
-        )
-
     return payload
+
+
+def _sample_vulnerable_target(
+    count: int, vuln_density: float, rng: random.Random | None = None
+) -> int:
+    """How many of `count` snippets should be vulnerable this round.
+
+    Each snippet is vulnerable with probability `vuln_density` (a binomial
+    draw). A fixed round(count * density) let players who knew the density
+    deduce the last answers by counting. At least one is always vulnerable so
+    every round has something to find.
+    """
+    rng = rng or random
+    drawn = sum(1 for _ in range(count) if rng.random() < vuln_density)
+    return max(1, drawn)
 
 
 def _normalize_vuln_type(is_vulnerable: bool, vuln_type: FrontendVulnType) -> FrontendVulnType:
@@ -261,22 +292,18 @@ def _normalize_vuln_type(is_vulnerable: bool, vuln_type: FrontendVulnType) -> Fr
 
 
 def _extract_json(text: str) -> str:
-    # Extract the first complete JSON object/array using bracket matching.
-    start = None
-    stack = []
+    # Return the first complete JSON object/array embedded in prose or a code
+    # fence. raw_decode is a real JSON parser, so brackets inside string values
+    # (code snippets are full of them) cannot unbalance it the way counting can.
+    decoder = json.JSONDecoder()
     for idx, char in enumerate(text):
-        if char in "{[":
-            if start is None:
-                start = idx
-            stack.append(char)
-        elif char in "}]":
-            if not stack:
-                continue
-            opening = stack.pop()
-            if (opening == "{" and char != "}") or (opening == "[" and char != "]"):
-                continue
-            if not stack and start is not None:
-                return text[start:idx + 1]
+        if char not in "{[":
+            continue
+        try:
+            _, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            continue
+        return text[idx:end]
     raise ValueError("Claude response did not contain valid JSON.")
 
 #for hints and field normalization
@@ -312,6 +339,9 @@ def _normalize_task_item(item: object) -> dict:
 
 
 def _strip_heading_marks(text: str) -> str:
-    # Keep periods, commas, and hyphens while stripping other leading symbols.
-    clean_text = re.sub(r"[^A-Za-z0-9\s\.,-]+", "", text)
+    # Remove Markdown markup (headings, bullets, quotes, emphasis, code ticks)
+    # but keep the prose itself, including apostrophes, brackets, quotes and
+    # colons, which an earlier character allowlist deleted ("user's" -> "users").
+    clean_text = re.sub(r"^\s*(?:#{1,6}|[-*+]|>)\s+", "", text, flags=re.MULTILINE)
+    clean_text = re.sub(r"\*\*|__|[*`]", "", clean_text)
     return re.sub(r"\s+", " ", clean_text).strip()

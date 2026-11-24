@@ -1,4 +1,4 @@
-import { useReducer, useCallback } from 'react';
+import { useReducer, useCallback, useMemo } from 'react';
 import type {
   GameState,
   Difficulty,
@@ -47,6 +47,7 @@ const initialState: GameState = {
   totalCorrect: 0,
   totalIncorrect: 0,
   gameOverReason: undefined,
+  auditStarted: false,
   auditReport: undefined,
 };
 
@@ -91,6 +92,7 @@ function gameReducer(state: GameState, action: GameAction): GameState {
         totalCorrect: 0,
         totalIncorrect: 0,
         gameOverReason: undefined,
+        auditStarted: false,
         auditReport: undefined,
       };
 
@@ -256,6 +258,7 @@ function gameReducer(state: GameState, action: GameAction): GameState {
       return {
         ...state,
         phase: 'AUDITING',
+        auditStarted: true,
       };
 
     case 'SET_AUDIT_REPORT':
@@ -345,21 +348,10 @@ export function useGameState() {
     dispatch({ type: 'RESET_GAME' });
   }, []);
 
-  // Computed values
-  const currentTask = state.tasks[state.currentTaskIndex] || null;
-  const completedTasks = state.tasks.filter((t) => t.status === 'completed').length;
-  const failedTasks = state.tasks.filter((t) => t.status === 'failed');
-  const pendingTasks = state.tasks.filter((t) => t.status === 'pending' || t.status === 'current');
-  const progress = state.tasks.length > 0 ? (completedTasks / state.tasks.length) * 100 : 0;
-
-  return {
-    state,
-    currentTask,
-    completedTasks,
-    failedTasks,
-    pendingTasks,
-    progress,
-    actions: {
+  // One stable object: App lists `actions` as an effect dependency, and a fresh
+  // object each render tore down and recreated the timer interval every tick.
+  const actions = useMemo(
+    () => ({
       setDifficulty,
       setLanguage,
       setEndlessMode,
@@ -375,7 +367,41 @@ export function useGameState() {
       setAuditReport,
       startDebrief,
       resetGame,
-    },
+    }),
+    [
+      setDifficulty,
+      setLanguage,
+      setEndlessMode,
+      startLoading,
+      loadTasks,
+      startPlaying,
+      answerTask,
+      nextTask,
+      tickTimer,
+      timeUp,
+      gameOver,
+      startAuditing,
+      setAuditReport,
+      startDebrief,
+      resetGame,
+    ]
+  );
+
+  // Computed values
+  const currentTask = state.tasks[state.currentTaskIndex] || null;
+  const completedTasks = state.tasks.filter((t) => t.status === 'completed').length;
+  const failedTasks = state.tasks.filter((t) => t.status === 'failed');
+  const pendingTasks = state.tasks.filter((t) => t.status === 'pending' || t.status === 'current');
+  const progress = state.tasks.length > 0 ? (completedTasks / state.tasks.length) * 100 : 0;
+
+  return {
+    state,
+    currentTask,
+    completedTasks,
+    failedTasks,
+    pendingTasks,
+    progress,
+    actions,
   };
 }
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -13,12 +16,24 @@ from .schemas import (
     Difficulty,
     FinishResponse,
     FrontendDifficulty,
+    FrontendLanguage,
     FrontendTask,
     MentorReportSchema,
     SubmitAnswersResponse,
     TaskPublicSchema,
     TaskSchema,
 )
+
+# Sessions idle for longer than this are discarded.
+DEFAULT_SESSION_TTL_SECONDS = 60 * 60
+
+# Hard ceiling on live sessions, so memory stays bounded even if sessions are
+# created faster than they expire.
+DEFAULT_MAX_SESSIONS = 1000
+
+
+class SessionFinishedError(Exception):
+    """Raised when answers arrive for a session whose report is already built."""
 
 
 @dataclass
@@ -27,38 +42,87 @@ class SessionData:
     difficulty: Difficulty
     created_at: datetime
     tasks: list[TaskSchema]
+    language: FrontendLanguage = "javascript"
     answers: dict[str, AnswerSchema] = field(default_factory=dict)
     audit_logs: list[AuditLogSchema] = field(default_factory=list)
     mentor_report: MentorReportSchema | None = None
+    # Set once the report is built. The audit logs cannot stand in for this:
+    # a perfect round has none, so it used to be re-audited on every request.
+    finished: bool = False
+    last_access: float = field(default_factory=time.monotonic)
+    # Serialises submit and finish for this session only, so two concurrent
+    # finish calls cannot both run the scanner, and one slow audit never blocks
+    # other players.
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 class InMemoryStore:
-    def __init__(self) -> None:
+    """Process-local session store.
+
+    Sessions live in one process's memory, so this does not survive a restart
+    or work across several server workers; that would need a shared store such
+    as Redis.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = DEFAULT_SESSION_TTL_SECONDS,
+        max_sessions: int = DEFAULT_MAX_SESSIONS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.sessions: dict[str, SessionData] = {}
+        self._ttl_seconds = ttl_seconds
+        self._max_sessions = max_sessions
+        self._clock = clock
+        # Guards the sessions dict itself; held only for quick dict operations.
+        self._lock = threading.Lock()
 
     # Create a new session with generated tasks
-    def create_session(self, difficulty: Difficulty, task_count: int) -> SessionData:
-        session_id = uuid4().hex
-        created_at = datetime.now(UTC)
-        tasks = generate_tasks(difficulty, task_count)
+    def create_session(
+        self, difficulty: Difficulty, task_count: int, language: FrontendLanguage = "javascript"
+    ) -> SessionData:
+        # Generation calls Claude and is slow, so it runs before taking the lock.
+        tasks = generate_tasks(difficulty, task_count, language)
         session = SessionData(
-            session_id=session_id,
+            session_id=uuid4().hex,
             difficulty=difficulty,
-            created_at=created_at,
+            created_at=datetime.now(UTC),
             tasks=tasks,
+            language=language,
+            last_access=self._clock(),
         )
-        self.sessions[session_id] = session
+        with self._lock:
+            self._evict_expired()
+            # At the cap, drop the least recently used session to make room.
+            while len(self.sessions) >= self._max_sessions:
+                oldest = min(self.sessions.values(), key=lambda s: s.last_access)
+                del self.sessions[oldest.session_id]
+            self.sessions[session.session_id] = session
         return session
 
-    # Retrieve a session by ID
+    # Retrieve a session by ID, refreshing its expiry
     def get_session(self, session_id: str) -> SessionData:
-        session = self.sessions.get(session_id)
-        if not session:
-            raise KeyError(f"Unknown session: {session_id}")
-        return session
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is not None and self._is_expired(session):
+                del self.sessions[session_id]
+                session = None
+            if session is None:
+                raise KeyError(f"Unknown session: {session_id}")
+            session.last_access = self._clock()
+            return session
+
+    def _is_expired(self, session: SessionData) -> bool:
+        return self._clock() - session.last_access > self._ttl_seconds
+
+    def _evict_expired(self) -> None:
+        # Caller holds self._lock.
+        for session_id in [sid for sid, s in self.sessions.items() if self._is_expired(s)]:
+            del self.sessions[session_id]
 
     def list_public_tasks(self, session_id: str) -> list[TaskPublicSchema]:
         session = self.get_session(session_id)
+        hints_allowed = DIFFICULTY_CONFIGS[session.difficulty].hints_allowed
         return [
             TaskPublicSchema(
                 id=task.id,
@@ -66,7 +130,7 @@ class InMemoryStore:
                 code=task.code,
                 difficulty=task.difficulty,
                 language=task.language,
-                hints=task.hints,
+                hints=task.hints if hints_allowed else None,
             )
             for task in session.tasks
         ]
@@ -85,10 +149,15 @@ class InMemoryStore:
                 raise ValueError(f"Duplicate answer for task id: {answer.task_id}")
             seen.add(answer.task_id)
 
-        for answer in answers:
-            session.answers[answer.task_id] = answer
+        with session.lock:
+            # The report is built from the answers at finish time, so accepting
+            # more afterwards would leave the score and the report disagreeing.
+            if session.finished:
+                raise SessionFinishedError(f"Session already finished: {session_id}")
+            for answer in answers:
+                session.answers[answer.task_id] = answer
+            correct, _, missed_task_ids = score_session(session)
 
-        correct, _, missed_task_ids = score_session(session)
         return SubmitAnswersResponse(
             correct=correct,
             incorrect=len(missed_task_ids),
@@ -97,48 +166,44 @@ class InMemoryStore:
 
     def finish_session(self, session_id: str) -> FinishResponse:
         session = self.get_session(session_id)
-        correct, _, missed_task_ids = score_session(session)
 
-        if not session.audit_logs:
-            try:
-                session.audit_logs = build_hacktron_audit_logs(session, missed_task_ids)
-            except Exception as exc:
-                session.audit_logs = [
-                    AuditLogSchema(task_id=task_id, raw_log=f"Audit failed: {str(exc)}")
-                    for task_id in missed_task_ids
-                ]
+        # Held for the whole audit: a concurrent finish waits here, then finds
+        # the session finished and returns the cached report instead of scanning.
+        with session.lock:
+            correct, _, missed_task_ids = score_session(session)
+            if not session.finished:
+                try:
+                    session.audit_logs = build_hacktron_audit_logs(session, missed_task_ids)
+                except Exception as exc:
+                    session.audit_logs = [
+                        AuditLogSchema(task_id=task_id, raw_log=f"Audit failed: {str(exc)}")
+                        for task_id in missed_task_ids
+                    ]
 
-        if session.mentor_report is None:
-            try:
-                session.mentor_report = build_mentor_report(session, missed_task_ids)
-            except Exception:
-                session.mentor_report = build_fallback_mentor_report(missed_task_ids)
+                try:
+                    session.mentor_report = build_mentor_report(session, missed_task_ids)
+                except Exception:
+                    session.mentor_report = build_fallback_mentor_report(missed_task_ids)
 
-        return FinishResponse(
-            session_id=session_id,
-            score=correct,
-            missed_task_ids=missed_task_ids,
-            audit_logs=session.audit_logs,
-            mentor_report=session.mentor_report,
-        )
+                session.finished = True
+
+            return FinishResponse(
+                session_id=session_id,
+                score=correct,
+                missed_task_ids=missed_task_ids,
+                audit_logs=session.audit_logs,
+                mentor_report=session.mentor_report,
+            )
 
     def get_session_results(self, session_id: str) -> FinishResponse:
-        session = self.get_session(session_id)
-
-        if not session.audit_logs or session.mentor_report is None:
-            return self.finish_session(session_id)
-
-        correct, _, missed_task_ids = score_session(session)
-        return FinishResponse(
-            session_id=session_id,
-            score=correct,
-            missed_task_ids=missed_task_ids,
-            audit_logs=session.audit_logs,
-            mentor_report=session.mentor_report,
-        )
+        # finish_session returns the cached report when the session is already
+        # finished, and builds it on demand when it is not.
+        return self.finish_session(session_id)
 
 # Generate tasks based on difficulty and count
-def generate_tasks(difficulty: Difficulty, task_count: int, language: str = "javascript") -> list[TaskSchema]:
+def generate_tasks(
+    difficulty: Difficulty, task_count: int, language: FrontendLanguage = "javascript"
+) -> list[TaskSchema]:
     config = DIFFICULTY_CONFIGS[difficulty]
     frontend_tasks = generate_frontend_tasks(
         language=language,
@@ -174,7 +239,7 @@ def build_hacktron_audit_logs(session: SessionData, missed_task_ids: list[str]) 
         return []
     missed_tasks = [task for task in session.tasks if task.id in missed_task_ids]
     task_payload = [(task.id, task.code) for task in missed_tasks]
-    logs = scan_with_hacktron(task_payload, missed_tasks[0].language or "javascript")
+    logs = scan_with_hacktron(task_payload, session.language)
     return [
         AuditLogSchema(task_id=task_id, raw_log=raw_log)
         for task_id, raw_log in logs

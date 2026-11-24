@@ -70,6 +70,28 @@ class TestGenerate:
 
         assert captured["vuln_density"] == 0.8
 
+    @pytest.mark.parametrize(
+        ("difficulty", "expect_hints"), [("EASY", True), ("MEDIUM", True), ("HARD", False)]
+    )
+    def test_hints_are_withheld_where_the_difficulty_disallows_them(
+        self, client, monkeypatch, make_frontend_task, difficulty, expect_hints
+    ):
+        task = make_frontend_task("t1").model_copy(update={"hints": ["look at the sink"]})
+        monkeypatch.setattr(main_module, "generate_frontend_tasks", lambda **kwargs: [task])
+
+        response = client.post(
+            "/generate",
+            json={
+                "language": "javascript",
+                "difficulty": difficulty,
+                "complexityLevel": "basic",
+                "count": 1,
+            },
+        )
+
+        hints = response.json()["tasks"][0]["hints"]
+        assert (hints == ["look at the sink"]) is expect_hints
+
     @pytest.mark.parametrize("difficulty", ["IMPOSSIBLE", "easy", ""])
     def test_invalid_difficulty_is_rejected_by_validation(self, client, difficulty):
         response = client.post(
@@ -117,7 +139,7 @@ class TestGenerate:
         assert response.status_code == 503
         assert "unreachable" in response.json()["detail"]
 
-    def test_malformed_upstream_payload_becomes_400(self, client, monkeypatch):
+    def test_malformed_upstream_payload_becomes_502(self, client, monkeypatch):
         def _explode(**kwargs):
             raise ValueError("Claude returned no usable tasks")
 
@@ -133,7 +155,7 @@ class TestGenerate:
             },
         )
 
-        assert response.status_code == 400
+        assert response.status_code == 502
 
     def test_unexpected_failure_does_not_leak_internals(self, client, monkeypatch):
         def _explode(**kwargs):
@@ -164,6 +186,28 @@ class TestAudit:
 
         assert response.status_code == 400
         assert "No tasks provided" in response.json()["detail"]
+
+    def test_oversized_requests_are_rejected_before_any_scan(
+        self, client, monkeypatch, make_frontend_task
+    ):
+        def _fail(*args, **kwargs):
+            raise AssertionError("an invalid request must not reach the scanner")
+
+        monkeypatch.setattr(main_module, "scan_with_hacktron", _fail)
+        too_many = [make_frontend_task(f"t{i}").model_dump() for i in range(11)]
+        too_long = {**make_frontend_task("t1").model_dump(), "code": "a" * 4001}
+
+        for tasks in (too_many, [too_long]):
+            response = client.post("/audit", json={"tasks": tasks, "language": "javascript"})
+            assert response.status_code == 422
+
+    def test_path_like_task_ids_are_rejected(self, client, monkeypatch, make_frontend_task):
+        monkeypatch.setattr(main_module, "scan_with_hacktron", lambda *a, **k: [])
+        task = {**make_frontend_task("t1").model_dump(), "id": "../../escape"}
+
+        response = client.post("/audit", json={"tasks": [task], "language": "javascript"})
+
+        assert response.status_code == 422
 
     def test_returns_findings_and_summary(self, client, monkeypatch, make_frontend_task):
         monkeypatch.setattr(main_module, "scan_with_hacktron", lambda *a, **k: [("t1", "log")])
@@ -231,21 +275,49 @@ class TestAudit:
         assert report["findings"] == []
 
 
-class TestLandingPage:
-    def test_serves_the_client_index_when_present(self, client, monkeypatch, tmp_path):
-        index = tmp_path / "index.html"
-        index.write_text("<html>game</html>", encoding="utf-8")
-        monkeypatch.setattr(main_module, "CLIENT_INDEX_PATH", index)
-
+class TestIndex:
+    def test_points_to_the_docs_and_health_check(self, client):
         response = client.get("/")
 
         assert response.status_code == 200
-        assert "game" in response.text
+        body = response.json()
+        assert body["docs"] == "/docs"
+        assert body["health"] == "/health"
+        assert client.get(body["docs"]).status_code == 200
+        assert client.get(body["health"]).status_code == 200
 
-    def test_returns_404_when_the_client_is_not_built(self, client, monkeypatch, tmp_path):
-        monkeypatch.setattr(main_module, "CLIENT_INDEX_PATH", tmp_path / "missing.html")
 
-        assert client.get("/").status_code == 404
+class TestCors:
+    ALLOWED = main_module.cors_origins[0].strip()
+
+    def _preflight(self, client, origin, method="POST", headers="content-type"):
+        return client.options(
+            "/generate",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": method,
+                "Access-Control-Request-Headers": headers,
+            },
+        )
+
+    def test_allowed_origin_may_post_json(self, client):
+        response = self._preflight(client, self.ALLOWED)
+
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == self.ALLOWED
+
+    def test_credentials_are_not_allowed(self, client):
+        response = self._preflight(client, self.ALLOWED)
+
+        assert "access-control-allow-credentials" not in response.headers
+
+    def test_unknown_origin_is_refused(self, client):
+        response = self._preflight(client, "https://evil.example")
+
+        assert "access-control-allow-origin" not in response.headers
+
+    def test_methods_the_client_never_uses_are_refused(self, client):
+        assert self._preflight(client, self.ALLOWED, method="DELETE").status_code == 400
 
 
 class TestTTS:
@@ -418,6 +490,56 @@ class TestSessionLifecycle:
 
         assert response.status_code == 400
         assert "Duplicate answer" in response.json()["detail"]
+
+    def test_submitting_after_finish_returns_409(self, client):
+        session_id = client.post(
+            "/session", json={"difficulty": "easy", "task_count": 2}
+        ).json()["session_id"]
+        client.post(f"/session/{session_id}/finish")
+
+        response = client.post(
+            f"/session/{session_id}/submit",
+            json={"answers": [{"task_id": "t1", "user_choice": "sabotaged"}]},
+        )
+
+        assert response.status_code == 409
+        assert "already finished" in response.json()["detail"]
+
+    def test_requested_language_is_echoed_back(self, client):
+        response = client.post(
+            "/session", json={"difficulty": "easy", "task_count": 2, "language": "python"}
+        )
+
+        assert response.status_code == 201
+        assert response.json()["language"] == "python"
+
+    def test_unsupported_language_is_rejected(self, client):
+        response = client.post(
+            "/session", json={"difficulty": "easy", "task_count": 2, "language": "cobol"}
+        )
+
+        assert response.status_code == 422
+
+    def test_malformed_upstream_reply_becomes_502(self, client, monkeypatch):
+        def _explode(**kwargs):
+            raise ValueError("Claude returned 1 tasks, expected 2.")
+
+        monkeypatch.setattr(store_module, "generate_frontend_tasks", _explode)
+
+        response = client.post("/session", json={"difficulty": "easy", "task_count": 2})
+
+        assert response.status_code == 502
+
+    def test_unexpected_failure_does_not_leak_internals(self, client, monkeypatch):
+        def _explode(**kwargs):
+            raise TypeError("secret internal detail")
+
+        monkeypatch.setattr(store_module, "generate_frontend_tasks", _explode)
+
+        response = client.post("/session", json={"difficulty": "easy", "task_count": 2})
+
+        assert response.status_code == 500
+        assert "secret internal detail" not in response.text
 
     def test_out_of_range_task_count_is_rejected(self, client):
         assert client.post("/session", json={"difficulty": "easy", "task_count": 0}).status_code == 422
