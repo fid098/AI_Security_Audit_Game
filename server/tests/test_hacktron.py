@@ -31,6 +31,10 @@ def fake_run(stdout: str = "{}", returncode: int = 0, stderr: str = "", delay: f
     _run.calls = calls
     return _run
 
+def scanned_code(cmd):
+    with open(cmd[-1], encoding="utf-8") as handle:
+        return handle.read()
+
 
 class TestExpandArgs:
     def test_no_args_returns_bare_path(self):
@@ -110,7 +114,7 @@ class TestScanning:
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
 
         monkeypatch.setattr(hacktron.subprocess, "run", _run)
-        tasks = [(f"t{i}", "code") for i in range(1, 5)]
+        tasks = [(f"t{i}", f"code{i}") for i in range(1, 5)]
 
         results = scan_with_hacktron(tasks, "javascript")
 
@@ -165,7 +169,7 @@ class TestScanning:
 
         scan_with_hacktron([("t1", "print(1)")], "python")
 
-        assert runner.calls[0][-1].endswith("t1.py")
+        assert runner.calls[0][-1].endswith(".py")
 
     def test_unknown_language_falls_back_to_txt(self, monkeypatch):
         monkeypatch.setenv("HACKTRON_CMD", "hacktron")
@@ -174,7 +178,7 @@ class TestScanning:
 
         scan_with_hacktron([("t1", "code")], "brainfuck")
 
-        assert runner.calls[0][-1].endswith("t1.txt")
+        assert runner.calls[0][-1].endswith(".txt")
 
     def test_snippet_is_written_to_a_temp_file_that_is_cleaned_up(self, monkeypatch):
         monkeypatch.setenv("HACKTRON_CMD", "hacktron")

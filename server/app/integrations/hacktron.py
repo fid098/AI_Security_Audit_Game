@@ -50,7 +50,7 @@ def scan_with_hacktron(tasks: Iterable[tuple[str, str]], language: str) -> list[
     def scan_one(task: tuple[str, str]) -> tuple[str, str]:
         task_id, code = task
         try:
-            return task_id, _scan_snippet(task_id, code, command, args, extension, use_wsl)
+            return task_id, _scan_snippet(code, command, args, extension, use_wsl)
         except RuntimeError as exc:
             return task_id, f"Hacktron scan failed: {exc}"
 
@@ -60,7 +60,6 @@ def scan_with_hacktron(tasks: Iterable[tuple[str, str]], language: str) -> list[
 
 
 def _scan_snippet(
-    task_id: str,
     code: str,
     command: str,
     args: list[str],
@@ -68,7 +67,8 @@ def _scan_snippet(
     use_wsl: bool,
 ) -> str:
     with tempfile.TemporaryDirectory() as temp_dir:
-        file_path = Path(temp_dir) / f"{task_id}{extension}"
+        #used snippet instead of task_id to avoid the client making server write the snippets code wherever they want
+        file_path = Path(temp_dir) / f"snippet{extension}"
         file_path.write_text(code, encoding="utf-8")
 
         target_path = _to_wsl_path(file_path) if use_wsl else str(file_path)
