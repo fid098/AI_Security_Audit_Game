@@ -203,7 +203,7 @@ class TestFaultIsolation:
         monkeypatch.setenv("HACKTRON_CMD", "hacktron")
 
         def _run(cmd, **kwargs):
-            if any("t2" in part for part in cmd):
+            if scanned_code(cmd) == "b":
                 return subprocess.CompletedProcess(
                     args=cmd, returncode=2, stdout="", stderr="boom"
                 )
