@@ -116,7 +116,7 @@ CORS_ORIGINS=http://localhost:5173,http://localhost:8080
 # {file} is replaced with the snippet path. Leave unset to skip scanning.
 HACKTRON_CMD=wsl
 HACKTRON_ARGS=$HOME/.local/bin/hacktron --format json {file}
-HACKTRON_MAX_WORKERS=4      # concurrent scans per audit
+HACKTRON_MAX_WORKERS=4      # max concurrent scans across the whole server
 HACKTRON_TIMEOUT=30         # seconds per scan
 ```
 
@@ -130,9 +130,14 @@ Vite inlines `VITE_*` at build time, so Docker takes it as a build arg instead.
 ## Scan Concurrency
 
 An audit scans every missed snippet, and each scan is an independent subprocess
-that spends nearly all its time blocked. Scans therefore run on a thread pool
-sized by `HACKTRON_MAX_WORKERS`, with results returned in request order and a
-failing scan isolated to its own snippet rather than aborting the batch.
+that spends nearly all its time blocked. Scans therefore run on a thread pool,
+with results returned in request order and a failing scan isolated to its own
+snippet rather than aborting the batch.
+
+`HACKTRON_MAX_WORKERS` is a server-wide limit, not a per-audit one: every scan
+takes a slot from one shared semaphore before starting its subprocess, so
+overlapping audits queue rather than each launching their own scanners. Time
+spent waiting for a slot does not count against `HACKTRON_TIMEOUT`.
 
 `server/benchmarks/bench_scan.py` measures the effect. It stubs the scanner with
 a fixed latency by default so the result is reproducible without the CLI
@@ -207,7 +212,8 @@ Snippets are served through a separate schema that omits `isVulnerable` and
 
 **Audits feel slow**
 - Raise `HACKTRON_MAX_WORKERS` (default 4) to scan more snippets concurrently,
-  or lower `HACKTRON_TIMEOUT` (default 30s) to fail slow scans faster.
+  or lower `HACKTRON_TIMEOUT` (default 30s) to fail slow scans faster. Because
+  the limit is shared, raise it if many players audit at once.
 
 ## License
 MIT (see LICENSE)

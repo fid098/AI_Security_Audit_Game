@@ -162,6 +162,56 @@ class TestScanning:
 
         assert state["peak"] <= 2
 
+    def test_the_limit_holds_across_concurrent_audits(self, monkeypatch):
+        """Per-request pools let three audits of four run twelve scanners at once."""
+        monkeypatch.setenv("HACKTRON_CMD", "hacktron")
+        monkeypatch.setenv("HACKTRON_MAX_WORKERS", "2")
+
+        lock = threading.Lock()
+        state = {"active": 0, "peak": 0}
+
+        def _run(cmd, **kwargs):
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            time.sleep(0.05)
+            with lock:
+                state["active"] -= 1
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
+
+        monkeypatch.setattr(hacktron.subprocess, "run", _run)
+        results = []
+
+        def _audit(n):
+            results.append(scan_with_hacktron([(f"a{n}-{i}", "code") for i in range(4)], "javascript"))
+
+        audits = [threading.Thread(target=_audit, args=(n,)) for n in range(3)]
+        for audit in audits:
+            audit.start()
+        for audit in audits:
+            audit.join(timeout=10)
+
+        assert state["peak"] == 2
+        assert sorted(len(r) for r in results) == [4, 4, 4]
+
+    def test_waiting_for_a_slot_does_not_eat_into_the_scan_timeout(self, monkeypatch):
+        """The subprocess timeout covers the scan only, not time queued behind others."""
+        monkeypatch.setenv("HACKTRON_CMD", "hacktron")
+        monkeypatch.setenv("HACKTRON_MAX_WORKERS", "1")
+        monkeypatch.setenv("HACKTRON_TIMEOUT", "7")
+        timeouts = []
+
+        def _run(cmd, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            time.sleep(0.02)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
+
+        monkeypatch.setattr(hacktron.subprocess, "run", _run)
+
+        scan_with_hacktron([(f"t{i}", "code") for i in range(3)], "javascript")
+
+        assert timeouts == [7, 7, 7]
+
     def test_language_selects_file_extension(self, monkeypatch):
         monkeypatch.setenv("HACKTRON_CMD", "hacktron")
         runner = fake_run()

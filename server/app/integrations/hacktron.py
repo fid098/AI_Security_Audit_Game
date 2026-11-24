@@ -4,8 +4,10 @@ import os
 import shlex
 import subprocess
 import tempfile
+import threading
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from functools import cache
 from pathlib import Path
 
 EXTENSIONS = {
@@ -33,6 +35,10 @@ def scan_with_hacktron(tasks: Iterable[tuple[str, str]], language: str) -> list[
     roughly one scan rather than N. A failing scan yields an error string for
     that task instead of aborting the batch, so one bad snippet cannot cost the
     player their entire audit.
+
+    HACKTRON_MAX_WORKERS caps scanner processes across the whole server, not
+    per call: overlapping audits share the same slots, so ten simultaneous
+    audits still run at most that many scanners at once.
     """
     task_list = list(tasks)
     if not task_list:
@@ -47,12 +53,17 @@ def scan_with_hacktron(tasks: Iterable[tuple[str, str]], language: str) -> list[
     use_wsl = command.lower() == "wsl"
     workers = min(_max_workers(), len(task_list))
 
+    slots = _scan_slots(_max_workers())
+
     def scan_one(task: tuple[str, str]) -> tuple[str, str]:
         task_id, code = task
-        try:
-            return task_id, _scan_snippet(code, command, args, extension, use_wsl)
-        except RuntimeError as exc:
-            return task_id, f"Hacktron scan failed: {exc}"
+        # Every scan in the process shares these slots, so concurrent audits
+        # queue here rather than each starting its own batch of scanners.
+        with slots:
+            try:
+                return task_id, _scan_snippet(code, command, args, extension, use_wsl)
+            except RuntimeError as exc:
+                return task_id, f"Hacktron scan failed: {exc}"
 
     # ThreadPoolExecutor.map preserves the ordering of its input iterable.
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -73,6 +84,14 @@ def _scan_snippet(
 
         target_path = _to_wsl_path(file_path) if use_wsl else str(file_path)
         return _run_command([command] + _expand_args(args, target_path))
+
+
+@cache
+def _scan_slots(limit: int) -> threading.BoundedSemaphore:
+    # One semaphore per configured limit, shared by every request in the
+    # process. Keying on the limit means a changed HACKTRON_MAX_WORKERS takes
+    # effect without a restart (the benchmark relies on this).
+    return threading.BoundedSemaphore(limit)
 
 
 def _max_workers() -> int:
