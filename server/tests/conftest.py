@@ -16,7 +16,10 @@ def isolate_environment(monkeypatch):
     """
     for name in (
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_MODEL",
         "ELEVENLABS_API_KEY",
+        "ELEVENLABS_VOICE_ID",
+        "ELEVENLABS_MODEL_ID",
         "HACKTRON_CMD",
         "HACKTRON_ARGS",
         "HACKTRON_MAX_WORKERS",

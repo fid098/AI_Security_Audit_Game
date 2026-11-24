@@ -4,7 +4,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 
 from .integrations.claude_client import generate_frontend_tasks, generate_security_mentor_summary
 from .integrations.elevenlabs import generate_speech, validate_api_key
@@ -28,19 +27,22 @@ from .schemas import (
 )
 from .store import InMemoryStore, SessionFinishedError
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
+# Fills in settings missing from the environment, for local development. Real
+# environment variables win, so values set by Docker or CI are never replaced
+# by a stale .env file.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 app = FastAPI(title="Security Sabotage API")
 store = InMemoryStore()
-
-CLIENT_INDEX_PATH = Path(__file__).resolve().parents[2] / "client" / "index.html"
 
 cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in cors_origins if origin.strip()],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # The app uses no cookies or HTTP auth, so browsers need not send them.
+    allow_credentials=False,
+    # Only what the client actually sends.
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -60,11 +62,16 @@ def elevenlabs_health() -> dict:
     }
 
 
-@app.get("/", response_class=HTMLResponse)
-def landing_page() -> HTMLResponse:
-    if CLIENT_INDEX_PATH.exists():
-        return HTMLResponse(CLIENT_INDEX_PATH.read_text(encoding="utf-8"))
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client landing page not found.")
+@app.get("/")
+def index() -> dict:
+    # The game itself is served by the client (Vite in development, nginx in
+    # Docker). This used to return client/index.html, which is the unbuilt dev
+    # source and could not load from here, and was absent in the image.
+    return {
+        "service": app.title,
+        "docs": app.docs_url,
+        "health": "/health",
+    }
 
 
 @app.post("/session", response_model=SessionCreateResponse, status_code=status.HTTP_201_CREATED)

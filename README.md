@@ -99,14 +99,16 @@ This is why `docker compose up` works on a clean machine with no configuration.
 
 ## Environment Variables
 
-Create a `.env` in the repo root. All values are optional.
+Create a `.env` in the repo root. All values are optional. Variables already set
+in the environment (for example by Docker Compose or CI) take precedence over `.env`.
 
 ```ini
 ANTHROPIC_API_KEY=your_key
 ANTHROPIC_MODEL=claude-sonnet-5
 
 ELEVENLABS_API_KEY=your_key
-ELEVENLABS_VOICE_ID=your_voice_id
+ELEVENLABS_VOICE_ID=your_voice_id   # replaces the built-in voice
+ELEVENLABS_MODEL_ID=                # defaults to eleven_monolingual_v1
 
 CORS_ORIGINS=http://localhost:5173,http://localhost:8080
 

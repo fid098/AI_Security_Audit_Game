@@ -275,21 +275,49 @@ class TestAudit:
         assert report["findings"] == []
 
 
-class TestLandingPage:
-    def test_serves_the_client_index_when_present(self, client, monkeypatch, tmp_path):
-        index = tmp_path / "index.html"
-        index.write_text("<html>game</html>", encoding="utf-8")
-        monkeypatch.setattr(main_module, "CLIENT_INDEX_PATH", index)
-
+class TestIndex:
+    def test_points_to_the_docs_and_health_check(self, client):
         response = client.get("/")
 
         assert response.status_code == 200
-        assert "game" in response.text
+        body = response.json()
+        assert body["docs"] == "/docs"
+        assert body["health"] == "/health"
+        assert client.get(body["docs"]).status_code == 200
+        assert client.get(body["health"]).status_code == 200
 
-    def test_returns_404_when_the_client_is_not_built(self, client, monkeypatch, tmp_path):
-        monkeypatch.setattr(main_module, "CLIENT_INDEX_PATH", tmp_path / "missing.html")
 
-        assert client.get("/").status_code == 404
+class TestCors:
+    ALLOWED = main_module.cors_origins[0].strip()
+
+    def _preflight(self, client, origin, method="POST", headers="content-type"):
+        return client.options(
+            "/generate",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": method,
+                "Access-Control-Request-Headers": headers,
+            },
+        )
+
+    def test_allowed_origin_may_post_json(self, client):
+        response = self._preflight(client, self.ALLOWED)
+
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == self.ALLOWED
+
+    def test_credentials_are_not_allowed(self, client):
+        response = self._preflight(client, self.ALLOWED)
+
+        assert "access-control-allow-credentials" not in response.headers
+
+    def test_unknown_origin_is_refused(self, client):
+        response = self._preflight(client, "https://evil.example")
+
+        assert "access-control-allow-origin" not in response.headers
+
+    def test_methods_the_client_never_uses_are_refused(self, client):
+        assert self._preflight(client, self.ALLOWED, method="DELETE").status_code == 400
 
 
 class TestTTS:
