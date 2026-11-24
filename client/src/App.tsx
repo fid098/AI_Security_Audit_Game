@@ -2,7 +2,7 @@ import { useEffect, useCallback, useState } from "react";
 import { useGameState, useAudio } from "./hooks";
 import { claudeService, hacktronService, elevenlabsService } from "./services";
 import { calculateGameConfig } from "./types";
-import type { Difficulty, DifficultyFactors, Language } from "./types";
+import type { Difficulty, DifficultyFactors, Language, Task } from "./types";
 
 // Components
 import { HomePage } from "./components/HomePage/HomePage";
@@ -16,6 +16,16 @@ import { AuditSplitScreen } from "./components/AuditSplitScreen/AuditSplitScreen
 import { GameInfoModal } from "./components/GameInfoModal/GameInfoModal";
 
 import "./App.css";
+
+// Tasks sent for audit: everything the player got wrong, plus (outside endless
+// mode) vulnerable tasks they never reached.
+function selectTasksToAudit(tasks: Task[], endlessMode: boolean): Task[] {
+  return endlessMode
+    ? tasks.filter((t) => t.status === "failed")
+    : tasks.filter(
+        (t) => t.status === "failed" || (t.isVulnerable && t.status !== "completed")
+      );
+}
 
 function App() {
   const { state, currentTask, failedTasks, actions } = useGameState();
@@ -131,6 +141,13 @@ function App() {
         audio.play("warning");
       }
 
+      // Flagging clean code ends the round: the reducer has already moved to
+      // AUDITING, so show the overlay that starts the audit.
+      if (answer === "vulnerable" && !currentTask.isVulnerable) {
+        setShowEmergency(true);
+        return;
+      }
+
       const isLastTask = state.currentTaskIndex >= state.tasks.length - 1;
       // Endless mode progression
       if (state.endlessMode && isLastTask) {
@@ -190,13 +207,7 @@ function App() {
     // Start auditing
     actions.startAuditing();
 
-    // Audit failed tasks
-    const tasksToAudit = state.endlessMode
-      ? state.tasks.filter((t) => t.status === "failed")
-      : state.tasks.filter(
-          (t) =>
-            t.status === "failed" || (t.isVulnerable && t.status !== "completed")
-        );
+    const tasksToAudit = selectTasksToAudit(state.tasks, state.endlessMode);
 
     if (tasksToAudit.length > 0) {
       const auditResult = await hacktronService.auditTasks({
@@ -234,7 +245,7 @@ function App() {
 
     // Move to debrief
     actions.startDebrief();
-  }, [actions, state.tasks, state.language]);
+  }, [actions, state.tasks, state.language, state.endlessMode]);
 
   // Handle restart
   const handleRestart = useCallback(() => {
@@ -357,10 +368,16 @@ function App() {
               disabled
               showTutorial={tutorialMode}
             />
-            {!state.auditReport && (
+            {/* Only once the audit has started; until then the emergency
+                overlay is up and the scan has not begun. */}
+            {!state.auditReport && !showEmergency && (
               <AuditSplitScreen
-                active={!state.auditReport}
-                findingsCount={state.tasks.filter((t) => t.isVulnerable).length}
+                active
+                findingsCount={
+                  selectTasksToAudit(state.tasks, state.endlessMode).filter(
+                    (t) => t.isVulnerable
+                  ).length
+                }
               />
             )}
             {showGameInfo && (
